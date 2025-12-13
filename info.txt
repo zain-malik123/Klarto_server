@@ -1,15 +1,23 @@
+for server app
+============== 
 set .env
  dart pub get
- dart run bin/server.dart.
+ dart run bin/server.dart
+
 
 Sendgrid
 52TFY2HNCBKRDQ22BFJQLEX8
 
-
+for web app
+===========
 flutter build web
 sudo rm -rf /var/www/html/*
 sudo cp -r build/web/* /var/www/html/
 sudo chown -R www-data:www-data /var/www/html
+
+local db dump
+=============
+"/c/Program Files/PostgreSQL/13/bin/pg_dump.exe" -U klarto_api_user -h localhost -p 5432 -d klarto_db -s -f "/c/Users/YourUser/Desktop/db_schema.sql"
 
 
 curl -X POST "https://smtp.maileroo.com/api/v2/emails" \
