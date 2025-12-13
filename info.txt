@@ -1,0 +1,31 @@
+set .env
+ dart pub get
+ dart run bin/server.dart.
+
+Sendgrid
+52TFY2HNCBKRDQ22BFJQLEX8
+
+
+flutter build web
+sudo rm -rf /var/www/html/*
+sudo cp -r build/web/* /var/www/html/
+sudo chown -R www-data:www-data /var/www/html
+
+
+curl -X POST "https://smtp.maileroo.com/api/v2/emails" \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer b8709d238fe70a1d19db569d3c14d0e92b49b2d0d95b6f3e9b2d66911139ed38" \
+  -d '{
+    "from": {
+      "address": "support@92fdd76d4f699117.maileroo.org",
+      "display_name": "Customer Care"
+    },
+    "to": [
+      {
+        "address": "rehannasim0@gmail.com",
+        "display_name": "Syed Rehan"
+      }
+    ],
+    "subject": "Test Email from Maileroo!",
+    "plain": "This is a plain‑text test email sent via Maileroo API."
+  }'
