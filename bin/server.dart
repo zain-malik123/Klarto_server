@@ -88,7 +88,7 @@ Future<Response> _signupHandler(Request request) async {
     );
 
     // 6. Send the verification email via Maileroo HTTP API.
-    final verificationUrl = '${Config.serverBaseUrl}/auth/verify?token=$verificationToken';
+    final verificationUrl = '${Config.clientBaseUrl}/verify-email?token=$verificationToken';
     final emailHtmlBody = '''
         <h1>Welcome to Klarto, $name!</h1>
         <p>Thank you for signing up. Please click the link below to verify your email address:</p>
