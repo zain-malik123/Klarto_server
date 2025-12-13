@@ -93,7 +93,7 @@ Future<Response> _signupHandler(Request request) async {
         <h1>Welcome to Klarto, $name!</h1>
         <p>Thank you for signing up. Please click the link below to verify your email address:</p>
         <p><a href="$verificationUrl">Verify My Email</a></p>
-        <p>This link will expire in 1 hours.</p>
+        <p>This link will expire in 1 hour.</p>
       ''';
 
     final mailerooUrl = Uri.parse('https://smtp.maileroo.com/api/v2/emails');

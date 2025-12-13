@@ -19,6 +19,9 @@ local db dump
 =============
 "/c/Program Files/PostgreSQL/13/bin/pg_dump.exe" -U klarto_api_user -h localhost -p 5432 -d klarto_db -s -f "/c/Users/YourUser/Desktop/db_schema.sql"
 
+remote use dump
+==============
+psql -U klarto_api_user -h localhost -p 5432 -d klarto_db -f db_schema.sql
 
 curl -X POST "https://smtp.maileroo.com/api/v2/emails" \
   -H "Content-Type: application/json" \
@@ -37,3 +40,10 @@ curl -X POST "https://smtp.maileroo.com/api/v2/emails" \
     "subject": "Test Email from Maileroo!",
     "plain": "This is a plain‑text test email sent via Maileroo API."
   }'
+
+
+remote databse
+================
+psql -U klarto_api_user -d klarto_db
+
+TRUNCATE TABLE users RESTART IDENTITY CASCADE;
