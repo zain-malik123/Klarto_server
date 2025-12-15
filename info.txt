@@ -10,6 +10,7 @@ Sendgrid
 
 for web app
 ===========
+ flutter create . --platforms web
 flutter build web
 sudo rm -rf /var/www/html/*
 sudo cp -r build/web/* /var/www/html/

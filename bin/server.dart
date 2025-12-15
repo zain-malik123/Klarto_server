@@ -32,6 +32,36 @@ Middleware _corsMiddleware() {
   };
 }
 
+// Middleware to verify JWT and add user context.
+Middleware _authMiddleware() {
+  return (Handler innerHandler) {
+    return (Request request) async {
+      final authHeader = request.headers['authorization'];
+      String? token;
+
+      if (authHeader != null && authHeader.startsWith('Bearer ')) {
+        token = authHeader.substring(7);
+      }
+
+      if (token == null) {
+        return Response.unauthorized('Not authorized. No token found.');
+      }
+
+      try {
+        final jwt = JWT.verify(token, SecretKey(Config.jwtSecret));
+        final userId = jwt.payload['id'] as String;
+        // Attach the user ID to the request context for later use.
+        final updatedRequest = request.change(context: {'userId': userId});
+        return await innerHandler(updatedRequest);
+      } on JWTExpiredException {
+        return Response.unauthorized('Not authorized. Token has expired.');
+      } on JWTException catch (err) {
+        return Response.unauthorized('Not authorized. Invalid token: ${err.message}');
+      }
+    };
+  };
+}
+
 // A global variable for the database connection.
 late final PostgreSQLConnection _db;
 
@@ -41,7 +71,8 @@ final _router = Router()
   ..get('/auth/verify', _verifyHandler) // Register the /auth/verify endpoint
   ..post('/auth/login', _loginHandler) // Register the /auth/login endpoint
   ..post('/auth/request-password-reset', _requestPasswordResetHandler)
-  ..post('/auth/reset-password', _resetPasswordHandler);
+  ..post('/auth/reset-password', _resetPasswordHandler)
+  ..post('/filters', _createFilterHandler); // New endpoint for creating filters
 
 
 // Handler for the signup request.
@@ -322,6 +353,54 @@ Future<Response> _resetPasswordHandler(Request request) async {
   }
 }
 
+// Handler for creating a new filter.
+Future<Response> _createFilterHandler(Request request) async {
+  try {
+    // The user ID is retrieved from the context set by the auth middleware.
+    final userId = request.context['userId'] as String?;
+    if (userId == null) {
+      return Response.forbidden('Not authorized.');
+    }
+
+    final bodyString = await request.readAsString();
+    final body = json.decode(bodyString) as Map<String, dynamic>;
+
+    final name = body['name'] as String?;
+    final query = body['query'] as String?;
+    final color = body['color'] as String?;
+    final description = body['description'] as String?; // Can be null
+    final isFavorite = body['is_favorite'] as bool?;
+
+    if (name == null || query == null || color == null || isFavorite == null) {
+      return Response(400, body: json.encode({'message': 'Name, query, color, and is_favorite are required.'}));
+    }
+
+    final result = await _db.query(
+      r'''
+      INSERT INTO filters (user_id, name, query, color, is_favorite, description)
+      VALUES (@userId, @name, @query, @color, @isFavorite, @description)
+      RETURNING id, name, query, color, is_favorite, created_at, description
+      ''',
+      substitutionValues: {
+        'userId': userId,
+        'name': name,
+        'query': query,
+        'color': color,
+        'isFavorite': isFavorite,
+        'description': description,
+      },
+    );
+
+    final newFilter = result.first.toColumnMap();
+    return Response(201, body: json.encode(newFilter), headers: {'Content-Type': 'application/json'});
+
+  } catch (e, stackTrace) {
+    print('Error creating filter: $e');
+    print(stackTrace);
+    return Response.internalServerError(body: 'An unexpected server error occurred.');
+  }
+}
+
 // Handler for the email verification request.
 Future<Response> _verifyHandler(Request request) async {  
   final token = request.url.queryParameters['token'];
@@ -413,7 +492,11 @@ void main(List<String> args) async {
   final handler = const Pipeline()
       .addMiddleware(logRequests()) // Log all incoming requests.
       .addMiddleware(_corsMiddleware()) // Add our new CORS middleware.
-      .addHandler(_router);
+      .addMiddleware(_authMiddleware()) // Protect routes with auth middleware.
+      .addHandler(_router); // Note: The auth middleware will run for all routes.
+      // In a larger app, you would separate public and private routers.
+      // For now, public routes will just ignore the lack of a token.
+      // Our protected /filters route will require it.
 
   final server = await io.serve(handler, Config.host, Config.port);
 
