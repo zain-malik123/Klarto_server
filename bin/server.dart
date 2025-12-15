@@ -14,7 +14,7 @@ import 'package:dart_jsonwebtoken/dart_jsonwebtoken.dart';
 const _corsHeaders = {
   'Access-Control-Allow-Origin': '*', // Allows any origin
   'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
-  'Access-Control-Allow-Headers': 'Origin, Content-Type',
+  'Access-Control-Allow-Headers': 'Origin, Content-Type, Authorization',
 };
 
 // Middleware to handle CORS.
@@ -35,6 +35,7 @@ Middleware _corsMiddleware() {
 // Middleware to verify JWT and add user context.
 Middleware _authMiddleware() {
   return (Handler innerHandler) {
+    print('Auth middleware is being applied.'); // Log when middleware is set up.
     return (Request request) async {
       final authHeader = request.headers['authorization'];
       String? token;
@@ -44,18 +45,23 @@ Middleware _authMiddleware() {
       }
 
       if (token == null) {
+        print('Auth Error: No token found.');
         return Response.unauthorized('Not authorized. No token found.');
       }
 
       try {
+        print('Auth: Verifying token...');
         final jwt = JWT.verify(token, SecretKey(Config.jwtSecret));
         final userId = jwt.payload['id'] as String;
+        print('Auth: Token verified for user ID: $userId');
         // Attach the user ID to the request context for later use.
         final updatedRequest = request.change(context: {'userId': userId});
         return await innerHandler(updatedRequest);
       } on JWTExpiredException {
+        print('Auth Error: Token has expired.');
         return Response.unauthorized('Not authorized. Token has expired.');
       } on JWTException catch (err) {
+        print('Auth Error: Invalid token - ${err.message}');
         return Response.unauthorized('Not authorized. Invalid token: ${err.message}');
       }
     };
@@ -388,11 +394,13 @@ Future<Response> _createFilterHandler(Request request) async {
     // The user ID is retrieved from the context set by the auth middleware.
     final userId = request.context['userId'] as String?;
     if (userId == null) {
+      print('Create Filter Error: User ID is null after auth middleware.');
       return Response.forbidden('Not authorized.');
     }
 
     final bodyString = await request.readAsString();
     final body = json.decode(bodyString) as Map<String, dynamic>;
+    print('Create Filter: Received body: $body');
 
     final name = body['name'] as String?;
     final query = body['query'] as String?;
@@ -401,6 +409,7 @@ Future<Response> _createFilterHandler(Request request) async {
     final isFavorite = body['is_favorite'] as bool?;
 
     if (name == null || query == null || color == null || isFavorite == null) {
+      print('Create Filter Error: Missing required fields.');
       return Response(400, body: json.encode({'message': 'Name, query, color, and is_favorite are required.'}));
     }
 
@@ -421,6 +430,7 @@ Future<Response> _createFilterHandler(Request request) async {
     );
 
     final newFilter = result.first.toColumnMap();
+    print('Create Filter: Successfully created filter: ${newFilter['id']}');
     return Response(201, body: json.encode(newFilter), headers: {'Content-Type': 'application/json'});
 
   } catch (e, stackTrace) {
