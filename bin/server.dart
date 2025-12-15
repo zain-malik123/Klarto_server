@@ -83,8 +83,10 @@ final _publicRouter = Router()
 final _privateRouter = Router()
   ..post('/filters', _createFilterHandler)
   ..get('/filters', _getFiltersHandler)
+  ..delete('/filters/<id>', _deleteFilterHandler)
   ..post('/labels', _createLabelHandler)
-  ..get('/labels', _getLabelsHandler);
+  ..get('/labels', _getLabelsHandler)
+  ..delete('/labels/<id>', _deleteLabelHandler);
 
 
 
@@ -450,6 +452,56 @@ Future<Response> _createFilterHandler(Request request) async {
 
   } catch (e, stackTrace) {
     print('Error creating filter: $e');
+    print(stackTrace);
+    return Response.internalServerError(body: 'An unexpected server error occurred.');
+  }
+}
+
+// Handler for deleting a filter.
+Future<Response> _deleteFilterHandler(Request request, String id) async {
+  try {
+    final userId = request.context['userId'] as String?;
+    if (userId == null) {
+      return Response.forbidden('Not authorized.');
+    }
+
+    final result = await _db.query(
+      'DELETE FROM filters WHERE id = @id AND user_id = @userId',
+      substitutionValues: {'id': id, 'userId': userId},
+    );
+
+    if (result.affectedRows == 0) {
+      return Response.notFound(json.encode({'message': 'Filter not found or you do not have permission to delete it.'}));
+    }
+
+    return Response.ok(json.encode({'message': 'Filter deleted successfully.'}));
+  } catch (e, stackTrace) {
+    print('Error deleting filter: $e');
+    print(stackTrace);
+    return Response.internalServerError(body: 'An unexpected server error occurred.');
+  }
+}
+
+// Handler for deleting a label.
+Future<Response> _deleteLabelHandler(Request request, String id) async {
+  try {
+    final userId = request.context['userId'] as String?;
+    if (userId == null) {
+      return Response.forbidden('Not authorized.');
+    }
+
+    final result = await _db.query(
+      'DELETE FROM labels WHERE id = @id AND user_id = @userId',
+      substitutionValues: {'id': id, 'userId': userId},
+    );
+
+    if (result.affectedRows == 0) {
+      return Response.notFound(json.encode({'message': 'Label not found or you do not have permission to delete it.'}));
+    }
+
+    return Response.ok(json.encode({'message': 'Label deleted successfully.'}));
+  } catch (e, stackTrace) {
+    print('Error deleting label: $e');
     print(stackTrace);
     return Response.internalServerError(body: 'An unexpected server error occurred.');
   }
