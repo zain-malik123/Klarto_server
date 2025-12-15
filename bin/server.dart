@@ -88,7 +88,8 @@ final _privateRouter = Router()
   ..get('/labels', _getLabelsHandler)
   ..delete('/labels/<id>', _deleteLabelHandler)
   ..post('/todos', _createTodoHandler)
-  ..get('/todos', _getTodosHandler);
+  ..get('/todos', _getTodosHandler)
+  ..get('/activities', _getActivitiesHandler);
 
 
 
@@ -803,6 +804,42 @@ Response _generateHtmlResponse({required String title, required String message, 
   ''';
 
   return Response.ok(html, headers: {'Content-Type': 'text/html'});
+}
+
+// Handler for getting all activities for a user.
+Future<Response> _getActivitiesHandler(Request request) async {
+  try {
+    final userId = request.context['userId'] as String?;
+    if (userId == null) {
+      return Response.forbidden('Not authorized.');
+    }
+
+    // Join with users table to get the user's name for the activity log
+    final result = await _db.query(
+      r'''
+      SELECT 
+        a.id, a.activity_name, a.description, a.created_at,
+        u.name as user_name 
+      FROM activities a
+      JOIN users u ON a.user_id = u.id
+      WHERE u.id = @userId -- For now, just fetching the current user's activities.
+      ORDER BY a.created_at DESC
+      ''',
+      substitutionValues: {'userId': userId},
+    );
+
+    final activities = result.map((row) {
+      final map = row.toColumnMap();
+      map['created_at'] = (map['created_at'] as DateTime).toIso8601String();
+      return map;
+    }).toList();
+
+    return Response.ok(json.encode(activities), headers: {'Content-Type': 'application/json'});
+  } catch (e, stackTrace) {
+    print('Error getting activities: $e');
+    print(stackTrace);
+    return Response.internalServerError(body: 'An unexpected server error occurred while fetching activities.');
+  }
 }
 
 // Helper function to log user activities.
