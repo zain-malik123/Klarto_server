@@ -82,7 +82,8 @@ final _publicRouter = Router()
 // Router for private endpoints that require a valid JWT.
 final _privateRouter = Router()
   ..post('/filters', _createFilterHandler)
-  ..get('/filters', _getFiltersHandler);
+  ..get('/filters', _getFiltersHandler)
+  ..post('/labels', _createLabelHandler);
 
 
 
@@ -448,6 +449,52 @@ Future<Response> _createFilterHandler(Request request) async {
 
   } catch (e, stackTrace) {
     print('Error creating filter: $e');
+    print(stackTrace);
+    return Response.internalServerError(body: 'An unexpected server error occurred.');
+  }
+}
+
+// Handler for creating a new label.
+Future<Response> _createLabelHandler(Request request) async {
+  try {
+    final userId = request.context['userId'] as String?;
+    if (userId == null) {
+      return Response.forbidden('Not authorized.');
+    }
+
+    final bodyString = await request.readAsString();
+    final body = json.decode(bodyString) as Map<String, dynamic>;
+
+    final name = body['name'] as String?;
+    final color = body['color'] as String?;
+    final isFavorite = body['is_favorite'] as bool?;
+
+    if (name == null || color == null || isFavorite == null) {
+      return Response(400, body: json.encode({'message': 'Name, color, and is_favorite are required.'}));
+    }
+
+    final result = await _db.query(
+      r'''
+      INSERT INTO labels (user_id, name, color, is_favorite)
+      VALUES (@userId, @name, @color, @isFavorite)
+      RETURNING id, name, color, is_favorite, created_at
+      ''',
+      substitutionValues: {
+        'userId': userId,
+        'name': name,
+        'color': color,
+        'isFavorite': isFavorite,
+      },
+    );
+
+    final newLabelMap = result.first.toColumnMap();
+    if (newLabelMap['created_at'] is DateTime) {
+      newLabelMap['created_at'] = (newLabelMap['created_at'] as DateTime).toIso8601String();
+    }
+
+    return Response(201, body: json.encode(newLabelMap), headers: {'Content-Type': 'application/json'});
+  } catch (e, stackTrace) {
+    print('Error creating label: $e');
     print(stackTrace);
     return Response.internalServerError(body: 'An unexpected server error occurred.');
   }

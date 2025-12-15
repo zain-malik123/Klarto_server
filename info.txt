@@ -4,6 +4,8 @@ set .env
  dart pub get
  dart run bin/server.dart
 
+git pull && git fetch && git pull && dart pub get && dart run bin/server.dart
+
 
 Sendgrid
 52TFY2HNCBKRDQ22BFJQLEX8
@@ -15,6 +17,9 @@ flutter build web
 sudo rm -rf /var/www/html/*
 sudo cp -r build/web/* /var/www/html/
 sudo chown -R www-data:www-data /var/www/html
+
+
+git add . && git commit -m "new api filter" && git push
 
 local db dump
 =============
