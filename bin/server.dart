@@ -87,7 +87,8 @@ final _privateRouter = Router()
   ..post('/labels', _createLabelHandler)
   ..get('/labels', _getLabelsHandler)
   ..delete('/labels/<id>', _deleteLabelHandler)
-  ..post('/todos', _createTodoHandler);
+  ..post('/todos', _createTodoHandler)
+  ..get('/todos', _getTodosHandler);
 
 
 
@@ -641,6 +642,46 @@ Future<Response> _createTodoHandler(Request request) async {
     print('Error creating todo: $e');
     print(stackTrace);
     return Response.internalServerError(body: 'An unexpected server error occurred while creating the todo.');
+  }
+}
+
+// Handler for getting all todos for a user.
+Future<Response> _getTodosHandler(Request request) async {
+  try {
+    final userId = request.context['userId'] as String?;
+    if (userId == null) {
+      return Response.forbidden('Not authorized.');
+    }
+
+    // Join with labels to get label name and color directly.
+    final result = await _db.query(
+      r'''
+      SELECT 
+        t.id, t.title, t.description, t.project_name, t.due_date, t.due_time, t.repeat_value, t.priority, t.is_completed, t.created_at,
+        l.name as label_name, l.color as label_color
+      FROM todos t
+      LEFT JOIN labels l ON t.label_id = l.id
+      WHERE t.user_id = @userId 
+      ORDER BY t.created_at DESC
+      ''',
+      substitutionValues: {'userId': userId},
+    );
+
+    final todos = result.map((row) {
+      final map = row.toColumnMap();
+      // Convert date/time objects to strings for JSON compatibility
+      map['created_at'] = (map['created_at'] as DateTime).toIso8601String();
+      if (map['due_date'] is DateTime) {
+        map['due_date'] = (map['due_date'] as DateTime).toIso8601String().substring(0, 10);
+      }
+      return map;
+    }).toList();
+
+    return Response.ok(json.encode(todos), headers: {'Content-Type': 'application/json'});
+  } catch (e, stackTrace) {
+    print('Error getting todos: $e');
+    print(stackTrace);
+    return Response.internalServerError(body: 'An unexpected server error occurred while fetching todos.');
   }
 }
 
