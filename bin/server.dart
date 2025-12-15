@@ -86,7 +86,8 @@ final _privateRouter = Router()
   ..delete('/filters/<id>', _deleteFilterHandler)
   ..post('/labels', _createLabelHandler)
   ..get('/labels', _getLabelsHandler)
-  ..delete('/labels/<id>', _deleteLabelHandler);
+  ..delete('/labels/<id>', _deleteLabelHandler)
+  ..post('/todos', _createTodoHandler);
 
 
 
@@ -579,6 +580,67 @@ Future<Response> _createLabelHandler(Request request) async {
     print('Error creating label: $e');
     print(stackTrace);
     return Response.internalServerError(body: 'An unexpected server error occurred.');
+  }
+}
+
+// Handler for creating a new todo.
+Future<Response> _createTodoHandler(Request request) async {
+  try {
+    final userId = request.context['userId'] as String?;
+    if (userId == null) {
+      return Response.forbidden('Not authorized.');
+    }
+
+    final bodyString = await request.readAsString();
+    final body = json.decode(bodyString) as Map<String, dynamic>;
+
+    // Extract and validate required fields
+    final title = body['title'] as String?;
+    final description = body['description'] as String?;
+    final projectName = body['project_name'] as String?;
+    final dueDate = body['due_date'] as String?;
+    final dueTime = body['due_time'] as String?;
+    final repeatValue = body['repeat_value'] as String?;
+    final priority = body['priority'] as int?;
+    final labelId = body['label_id'] as String?;
+
+    if (title == null || description == null || projectName == null || dueDate == null || dueTime == null || repeatValue == null || priority == null || labelId == null) {
+      return Response(400, body: json.encode({'message': 'All fields are required.'}));
+    }
+
+    final result = await _db.query(
+      r'''
+      INSERT INTO todos (user_id, title, description, project_name, due_date, due_time, repeat_value, priority, label_id)
+      VALUES (@userId, @title, @description, @projectName, @dueDate, @dueTime, @repeatValue, @priority, @labelId)
+      RETURNING *
+      ''',
+      substitutionValues: {
+        'userId': userId,
+        'title': title,
+        'description': description,
+        'projectName': projectName,
+        'dueDate': dueDate,
+        'dueTime': dueTime,
+        'repeatValue': repeatValue,
+        'priority': priority,
+        'labelId': labelId,
+      },
+    );
+
+    final newTodoMap = result.first.toColumnMap();
+    // Convert DateTime objects to ISO 8601 strings for JSON compatibility
+    newTodoMap['created_at'] = (newTodoMap['created_at'] as DateTime).toIso8601String();
+    newTodoMap['updated_at'] = (newTodoMap['updated_at'] as DateTime).toIso8601String();
+    if (newTodoMap['due_date'] is DateTime) {
+      newTodoMap['due_date'] = (newTodoMap['due_date'] as DateTime).toIso8601String().substring(0, 10);
+    }
+
+    return Response(201, body: json.encode(newTodoMap), headers: {'Content-Type': 'application/json'});
+
+  } catch (e, stackTrace) {
+    print('Error creating todo: $e');
+    print(stackTrace);
+    return Response.internalServerError(body: 'An unexpected server error occurred while creating the todo.');
   }
 }
 
