@@ -674,6 +674,10 @@ Future<Response> _getTodosHandler(Request request) async {
       if (map['due_date'] is DateTime) {
         map['due_date'] = (map['due_date'] as DateTime).toIso8601String().substring(0, 10);
       }
+      // Add handling for due_time, which is also not directly JSON serializable.
+      if (map['due_time'] != null && map['due_time'] is! String) {
+        map['due_time'] = map['due_time'].toString();
+      }
       return map;
     }).toList();
 
