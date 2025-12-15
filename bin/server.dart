@@ -237,6 +237,13 @@ Future<Response> _loginHandler(Request request) async {
     final jwt = JWT({'id': userId});
     final token = jwt.sign(SecretKey(Config.jwtSecret), expiresIn: const Duration(days: 7));
 
+    // Log the login activity
+    _logActivity(
+      userId: userId,
+      activityName: 'User Login',
+      description: 'User successfully logged in.',
+    );
+
     return Response.ok(
       json.encode({'token': token}),
       headers: {'Content-Type': 'application/json'},
@@ -449,6 +456,13 @@ Future<Response> _createFilterHandler(Request request) async {
       newFilterMap['created_at'] = (newFilterMap['created_at'] as DateTime).toIso8601String();
     }
 
+    // Log the activity
+    _logActivity(
+      userId: userId,
+      activityName: 'Add Filter',
+      description: 'User added a new filter: "${newFilterMap['name']}"',
+    );
+
     print('Create Filter: Successfully created filter: ${newFilterMap['id']}');
     return Response(201, body: json.encode(newFilterMap), headers: {'Content-Type': 'application/json'});
 
@@ -476,6 +490,13 @@ Future<Response> _deleteFilterHandler(Request request, String id) async {
       return Response.notFound(json.encode({'message': 'Filter not found or you do not have permission to delete it.'}));
     }
 
+    // Log the activity
+    _logActivity(
+      userId: userId,
+      activityName: 'Delete Filter',
+      description: 'User deleted a filter (ID: $id).',
+    );
+
     return Response.ok(json.encode({'message': 'Filter deleted successfully.'}));
   } catch (e, stackTrace) {
     print('Error deleting filter: $e');
@@ -500,6 +521,13 @@ Future<Response> _deleteLabelHandler(Request request, String id) async {
     if (result.affectedRowCount == 0) {
       return Response.notFound(json.encode({'message': 'Label not found or you do not have permission to delete it.'}));
     }
+
+    // Log the activity
+    _logActivity(
+      userId: userId,
+      activityName: 'Delete Label',
+      description: 'User deleted a label (ID: $id).',
+    );
 
     return Response.ok(json.encode({'message': 'Label deleted successfully.'}));
   } catch (e, stackTrace) {
@@ -576,6 +604,13 @@ Future<Response> _createLabelHandler(Request request) async {
       newLabelMap['created_at'] = (newLabelMap['created_at'] as DateTime).toIso8601String();
     }
 
+    // Log the activity
+    _logActivity(
+      userId: userId,
+      activityName: 'Add Label',
+      description: 'User added a new label: "${newLabelMap['name']}"',
+    );
+
     return Response(201, body: json.encode(newLabelMap), headers: {'Content-Type': 'application/json'});
   } catch (e, stackTrace) {
     print('Error creating label: $e');
@@ -635,6 +670,13 @@ Future<Response> _createTodoHandler(Request request) async {
     if (newTodoMap['due_date'] is DateTime) {
       newTodoMap['due_date'] = (newTodoMap['due_date'] as DateTime).toIso8601String().substring(0, 10);
     }
+
+    // Log the activity
+    _logActivity(
+      userId: userId,
+      activityName: 'Add Todo',
+      description: 'User added a new todo: "${newTodoMap['title']}"',
+    );
 
     return Response(201, body: json.encode(newTodoMap), headers: {'Content-Type': 'application/json'});
 
@@ -761,6 +803,30 @@ Response _generateHtmlResponse({required String title, required String message, 
   ''';
 
   return Response.ok(html, headers: {'Content-Type': 'text/html'});
+}
+
+// Helper function to log user activities.
+Future<void> _logActivity({
+  required String userId,
+  required String activityName,
+  required String description,
+}) async {
+  try {
+    await _db.query(
+      r'''
+      INSERT INTO activities (user_id, activity_name, description)
+      VALUES (@userId, @activityName, @description)
+      ''',
+      substitutionValues: {
+        'userId': userId,
+        'activityName': activityName,
+        'description': description,
+      },
+    );
+  } catch (e) {
+    // Log the error to the console but don't let it fail the main API request.
+    print('Error logging activity: $e');
+  }
 }
 
 void main(List<String> args) async {
