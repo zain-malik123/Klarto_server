@@ -83,7 +83,8 @@ final _publicRouter = Router()
 final _privateRouter = Router()
   ..post('/filters', _createFilterHandler)
   ..get('/filters', _getFiltersHandler)
-  ..post('/labels', _createLabelHandler);
+  ..post('/labels', _createLabelHandler)
+  ..get('/labels', _getLabelsHandler);
 
 
 
@@ -449,6 +450,35 @@ Future<Response> _createFilterHandler(Request request) async {
 
   } catch (e, stackTrace) {
     print('Error creating filter: $e');
+    print(stackTrace);
+    return Response.internalServerError(body: 'An unexpected server error occurred.');
+  }
+}
+
+// Handler for getting all labels for a user.
+Future<Response> _getLabelsHandler(Request request) async {
+  try {
+    final userId = request.context['userId'] as String?;
+    if (userId == null) {
+      return Response.forbidden('Not authorized.');
+    }
+
+    final result = await _db.query(
+      'SELECT id, name, color, is_favorite, created_at FROM labels WHERE user_id = @userId ORDER BY created_at DESC',
+      substitutionValues: {'userId': userId},
+    );
+
+    final labels = result.map((row) {
+      final map = row.toColumnMap();
+      if (map['created_at'] is DateTime) {
+        map['created_at'] = (map['created_at'] as DateTime).toIso8601String();
+      }
+      return map;
+    }).toList();
+
+    return Response.ok(json.encode(labels), headers: {'Content-Type': 'application/json'});
+  } catch (e, stackTrace) {
+    print('Error getting labels: $e');
     print(stackTrace);
     return Response.internalServerError(body: 'An unexpected server error occurred.');
   }
