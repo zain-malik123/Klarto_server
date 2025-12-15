@@ -470,7 +470,7 @@ Future<Response> _deleteFilterHandler(Request request, String id) async {
       substitutionValues: {'id': id, 'userId': userId},
     );
 
-    if (result.affectedRows == 0) {
+    if (result.affectedRowCount == 0) {
       return Response.notFound(json.encode({'message': 'Filter not found or you do not have permission to delete it.'}));
     }
 
@@ -495,7 +495,7 @@ Future<Response> _deleteLabelHandler(Request request, String id) async {
       substitutionValues: {'id': id, 'userId': userId},
     );
 
-    if (result.affectedRows == 0) {
+    if (result.affectedRowCount == 0) {
       return Response.notFound(json.encode({'message': 'Label not found or you do not have permission to delete it.'}));
     }
 
