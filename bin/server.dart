@@ -65,14 +65,20 @@ Middleware _authMiddleware() {
 // A global variable for the database connection.
 late final PostgreSQLConnection _db;
 
-// The main router for our API.
-final _router = Router()
-  ..post('/auth/signup', _signupHandler) // Register the /auth/signup endpoint
-  ..get('/auth/verify', _verifyHandler) // Register the /auth/verify endpoint
-  ..post('/auth/login', _loginHandler) // Register the /auth/login endpoint
+// Router for public endpoints that do not require authentication.
+final _publicRouter = Router()
+  ..post('/auth/signup', _signupHandler)
+  ..get('/auth/verify', _verifyHandler)
+  ..post('/auth/login', _loginHandler)
   ..post('/auth/request-password-reset', _requestPasswordResetHandler)
-  ..post('/auth/reset-password', _resetPasswordHandler)
-  ..post('/filters', _createFilterHandler); // New endpoint for creating filters
+  ..post('/auth/reset-password', _resetPasswordHandler);
+
+// Router for private endpoints that require a valid JWT.
+final _privateRouter = Router()
+  ..post('/api/filters', _createFilterHandler)
+  ..get('/api/filters', _getFiltersHandler);
+
+
 
 
 // Handler for the signup request.
@@ -353,6 +359,29 @@ Future<Response> _resetPasswordHandler(Request request) async {
   }
 }
 
+// Handler for getting all filters for a user.
+Future<Response> _getFiltersHandler(Request request) async {
+  try {
+    final userId = request.context['userId'] as String?;
+    if (userId == null) {
+      return Response.forbidden('Not authorized.');
+    }
+
+    final result = await _db.query(
+      'SELECT id, name, query, color, is_favorite, created_at, description FROM filters WHERE user_id = @userId ORDER BY created_at DESC',
+      substitutionValues: {'userId': userId},
+    );
+
+    final filters = result.map((row) => row.toColumnMap()).toList();
+
+    return Response.ok(json.encode(filters), headers: {'Content-Type': 'application/json'});
+  } catch (e, stackTrace) {
+    print('Error getting filters: $e');
+    print(stackTrace);
+    return Response.internalServerError(body: 'An unexpected server error occurred.');
+  }
+}
+
 // Handler for creating a new filter.
 Future<Response> _createFilterHandler(Request request) async {
   try {
@@ -489,14 +518,13 @@ void main(List<String> args) async {
   print('Successfully connected to the database.');
 
   // --- Server Setup ---
+  // Combine public and private routes. Apply auth middleware only to private routes.
+  final cascade = Cascade().add(_publicRouter).add(_authMiddleware()(_privateRouter));
+
   final handler = const Pipeline()
       .addMiddleware(logRequests()) // Log all incoming requests.
       .addMiddleware(_corsMiddleware()) // Add our new CORS middleware.
-      .addMiddleware(_authMiddleware()) // Protect routes with auth middleware.
-      .addHandler(_router); // Note: The auth middleware will run for all routes.
-      // In a larger app, you would separate public and private routers.
-      // For now, public routes will just ignore the lack of a token.
-      // Our protected /filters route will require it.
+      .addHandler(cascade.handler);
 
   final server = await io.serve(handler, Config.host, Config.port);
 
