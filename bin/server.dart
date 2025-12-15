@@ -81,8 +81,8 @@ final _publicRouter = Router()
 
 // Router for private endpoints that require a valid JWT.
 final _privateRouter = Router()
-  ..post('/api/filters', _createFilterHandler)
-  ..get('/api/filters', _getFiltersHandler);
+  ..post('/filters', _createFilterHandler)
+  ..get('/filters', _getFiltersHandler);
 
 
 
