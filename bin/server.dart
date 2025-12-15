@@ -378,7 +378,14 @@ Future<Response> _getFiltersHandler(Request request) async {
       substitutionValues: {'userId': userId},
     );
 
-    final filters = result.map((row) => row.toColumnMap()).toList();
+    // Convert DateTime objects to strings before encoding
+    final filters = result.map((row) {
+      final map = row.toColumnMap();
+      if (map['created_at'] is DateTime) {
+        map['created_at'] = (map['created_at'] as DateTime).toIso8601String();
+      }
+      return map;
+    }).toList();
 
     return Response.ok(json.encode(filters), headers: {'Content-Type': 'application/json'});
   } catch (e, stackTrace) {
@@ -429,9 +436,15 @@ Future<Response> _createFilterHandler(Request request) async {
       },
     );
 
-    final newFilter = result.first.toColumnMap();
-    print('Create Filter: Successfully created filter: ${newFilter['id']}');
-    return Response(201, body: json.encode(newFilter), headers: {'Content-Type': 'application/json'});
+    final newFilterMap = result.first.toColumnMap();
+
+    // Convert DateTime to a JSON-compatible string format (ISO 8601)
+    if (newFilterMap['created_at'] is DateTime) {
+      newFilterMap['created_at'] = (newFilterMap['created_at'] as DateTime).toIso8601String();
+    }
+
+    print('Create Filter: Successfully created filter: ${newFilterMap['id']}');
+    return Response(201, body: json.encode(newFilterMap), headers: {'Content-Type': 'application/json'});
 
   } catch (e, stackTrace) {
     print('Error creating filter: $e');
