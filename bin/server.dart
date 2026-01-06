@@ -1,6 +1,7 @@
 import 'dart:convert';
 import 'dart:io';
 import 'dart:math';
+import 'dart:typed_data';
 
 import 'package:shelf/shelf.dart';
 import 'package:shelf/shelf_io.dart' as io;
@@ -83,6 +84,10 @@ final _publicRouter = Router()
   ..post('/auth/request-password-reset', _requestPasswordResetHandler)
   ..post('/auth/reset-password', _resetPasswordHandler);
 
+// Public endpoint for invitees to set their password using the invite token.
+final _publicInviteRouter = Router()
+  ..post('/team/invite/set-password', _setPasswordForInviteHandler);
+
 // Router for private endpoints that require a valid JWT.
 final _privateRouter = Router()
   ..post('/filters', _createFilterHandler)
@@ -96,7 +101,9 @@ final _privateRouter = Router()
   ..get('/activities', _getActivitiesHandler)
   ..put('/profile', _updateProfileHandler)
   ..post('/profile/avatar', _uploadAvatarHandler)
-  ..get('/profile/avatar', _getAvatarHandler);
+  ..get('/profile/avatar', _getAvatarHandler)
+  ..post('/team/invite', _inviteHandler)
+  ..get('/team/invite/accept', _acceptInviteHandler);
 
 
 // Handler for the signup request.
@@ -757,11 +764,60 @@ Future<Response> _verifyHandler(Request request) async {
     );
 
     if (result.isEmpty) {
-      return _generateHtmlResponse(
-        title: 'Invalid Token',
-        message: 'This verification link is not valid. It may have already been used.',
-        isSuccess: false,
+      // Not a simple user verification token; check if it's an invitation token.
+      final invRows = await _db.query(
+        'SELECT id, team_id, invited_user_id, email, invite_token_expires_at, status FROM invitations WHERE invite_token = @token',
+        substitutionValues: {'token': token},
       );
+
+      if (invRows.isEmpty) {
+        return _generateHtmlResponse(
+          title: 'Invalid Token',
+          message: 'This verification link is not valid. It may have already been used.',
+          isSuccess: false,
+        );
+      }
+
+      final inv = invRows.first.toColumnMap();
+      final invitationId = inv['id'] as String;
+      final teamId = inv['team_id'] as String;
+      final invitedUserId = inv['invited_user_id'] as String?;
+      final email = inv['email'] as String;
+      final expiresAt = inv['invite_token_expires_at'] as DateTime?;
+      final status = inv['status'] as String?;
+
+      if (status == 'accepted') {
+        return _generateHtmlResponse(title: 'Already Accepted', message: 'This invitation was already accepted.', isSuccess: false);
+      }
+      if (expiresAt != null && expiresAt.isBefore(DateTime.now())) {
+        return _generateHtmlResponse(title: 'Expired', message: 'This invitation has expired.', isSuccess: false);
+      }
+
+      String userId = invitedUserId ?? '';
+      if (userId.isEmpty) {
+        final u = await _db.query('SELECT id FROM users WHERE LOWER(email) = LOWER(@email)', substitutionValues: {'email': email});
+        if (u.isEmpty) {
+          return _generateHtmlResponse(title: 'User Not Found', message: 'No user account found for this invitation.', isSuccess: false);
+        }
+        userId = u.first[0] as String;
+      }
+
+      // Mark user verified
+      await _db.query('UPDATE users SET is_verified = true, verification_token = NULL, verification_token_expires_at = NULL WHERE id = @id', substitutionValues: {'id': userId});
+
+      // Add to team if not already
+      final exists = await _db.query('SELECT id FROM team_members WHERE team_id = @team AND user_id = @user', substitutionValues: {'team': teamId, 'user': userId});
+      if (exists.isEmpty) {
+        await _db.query('INSERT INTO team_members (team_id, user_id, role) VALUES (@team, @user, @role)', substitutionValues: {'team': teamId, 'user': userId, 'role': 'member'});
+      }
+
+      // Update invitation status
+      await _db.query('UPDATE invitations SET status = @status, accepted_at = @accepted WHERE id = @id', substitutionValues: {'status': 'accepted', 'accepted': DateTime.now().toIso8601String(), 'id': invitationId});
+
+      // Generate JWT so the user can be logged in immediately
+      final jwtToken = JWT({'id': userId}).sign(SecretKey(Config.jwtSecret), expiresIn: const Duration(days: 7));
+      final redirectUrl = '${Config.clientBaseUrl}/verify-email?auth=$jwtToken&inviteAccepted=1';
+      return Response.seeOther(Uri.parse(redirectUrl));
     }
 
     final user = result.first;
@@ -783,11 +839,30 @@ Future<Response> _verifyHandler(Request request) async {
       substitutionValues: {'id': userId},
     );
 
-    return _generateHtmlResponse(
-      title: 'Email Verified Successfully!',
-      message: 'Thank you for verifying your email. You can now log in to your account.',
-      isSuccess: true,
-    );
+    // If there is a pending invitation matching this token, attach user to the team
+    try {
+      final invRows = await _db.query('SELECT id, team_id, status FROM invitations WHERE invite_token = @token', substitutionValues: {'token': token});
+      if (invRows.isNotEmpty) {
+        final inv = invRows.first.toColumnMap();
+        final invitationId = inv['id'] as String;
+        final teamId = inv['team_id'] as String;
+        final status = inv['status'] as String?;
+        if (status != 'accepted') {
+          final exists = await _db.query('SELECT id FROM team_members WHERE team_id = @team AND user_id = @user', substitutionValues: {'team': teamId, 'user': userId});
+          if (exists.isEmpty) {
+            await _db.query('INSERT INTO team_members (team_id, user_id, role) VALUES (@team, @user, @role)', substitutionValues: {'team': teamId, 'user': userId, 'role': 'member'});
+          }
+          await _db.query('UPDATE invitations SET status = @status, accepted_at = @accepted, invited_user_id = @uid WHERE id = @id', substitutionValues: {'status': 'accepted', 'accepted': DateTime.now().toIso8601String(), 'uid': userId, 'id': invitationId});
+        }
+      }
+    } catch (e) {
+      print('Error attaching user to team during verify flow: $e');
+    }
+
+    // Generate JWT and redirect so the user can login immediately
+    final jwtToken = JWT({'id': userId}).sign(SecretKey(Config.jwtSecret), expiresIn: const Duration(days: 7));
+    final redirectUrl = '${Config.clientBaseUrl}/verify-email?auth=$jwtToken';
+    return Response.seeOther(Uri.parse(redirectUrl));
   } catch (e, stackTrace) {
     print('Error during verification: $e');
     print(stackTrace);
@@ -907,6 +982,29 @@ Future<Response> _uploadAvatarHandler(Request request) async {
         return Response(400, body: json.encode({'message': 'No avatar_base64 found in request.'}));
       }
 
+      // Validate data URI and allowed mime types
+        final match = RegExp(r'^data:(image\/(png|jpeg|jpg|webp));base64,(.+)', caseSensitive: false).firstMatch(profileBase64);
+      // Some clients may use uppercase or omit charset; try a more lenient fallback if first pattern fails
+      RegExp lateRe = RegExp(r'^data:(image\/(png|jpeg|jpg|webp));base64,(.+)', caseSensitive: false);
+      final m = match ?? lateRe.firstMatch(profileBase64);
+      if (m == null) {
+        return Response(400, body: json.encode({'message': 'Unsupported image type or invalid data URI. Allowed: png, jpeg, webp.'}));
+      }
+
+      final encoded = m.group(3) ?? '';
+      late Uint8List decodedBytes;
+      try {
+        decodedBytes = base64.decode(encoded);
+      } catch (e) {
+        return Response(400, body: json.encode({'message': 'Invalid base64 image data.'}));
+      }
+
+      // Enforce max size (1MB)
+      const maxBytes = 1024 * 1024;
+      if (decodedBytes.length > maxBytes) {
+        return Response(413, body: json.encode({'message': 'Image too large. Max size is 1MB.'}));
+      }
+
     await _db.query(
       'UPDATE users SET profile_picture_base64 = @b64 WHERE id = @id',
       substitutionValues: {'b64': profileBase64, 'id': userId},
@@ -984,6 +1082,7 @@ void main(List<String> args) async {
   final cascade = Cascade()
       .add(createStaticHandler('public'))
       .add(_publicRouter)
+      .add(_publicInviteRouter)
       .add(_authMiddleware()(_privateRouter));
 
   final handler = const Pipeline()
@@ -1020,5 +1119,292 @@ Future<Response> _getAvatarHandler(Request request) async {
     print('Error retrieving avatar: $e');
     print(stackTrace);
     return Response.internalServerError(body: 'An unexpected server error occurred.');
+  }
+}
+
+// Handler to invite team members (max 3 emails). Creates accounts if missing and sends invite/accept links.
+Future<Response> _inviteHandler(Request request) async {
+  try {
+    final inviterId = request.context['userId'] as String?;
+    if (inviterId == null) return Response.forbidden('Not authorized.');
+
+    final bodyString = await request.readAsString();
+    final body = json.decode(bodyString) as Map<String, dynamic>;
+
+    List<String> emails = [];
+    if (body['emails'] is String) {
+      emails = (body['emails'] as String).split(',').map((s) => s.trim()).where((s) => s.isNotEmpty).toList();
+    } else if (body['emails'] is List) {
+      emails = (body['emails'] as List).map((e) => e.toString().trim()).where((s) => s.isNotEmpty).toList();
+    }
+
+    if (emails.isEmpty) return Response(400, body: json.encode({'message': 'No emails provided.'}));
+    if (emails.length > 3) return Response(400, body: json.encode({'message': 'You can invite up to 3 members.'}));
+
+    // Rate-limit: prevent abuse by limiting invites per inviter to 10 per hour
+    final recentCountRes = await _db.query(
+      "SELECT COUNT(*) FROM invitations WHERE inviter_id = @inviter AND created_at > (now() - interval '1 hour')",
+      substitutionValues: {'inviter': inviterId},
+    );
+    final recentCount = (recentCountRes.isNotEmpty && recentCountRes.first.isNotEmpty) ? (recentCountRes.first[0] as int) : 0;
+    if (recentCount + emails.length > 10) {
+      return Response(429, body: json.encode({'message': 'Invite rate limit exceeded. Try again later.'}));
+    }
+
+    // Find or create a team for inviter
+    var teamResult = await _db.query('SELECT id FROM teams WHERE owner_id = @owner', substitutionValues: {'owner': inviterId});
+    String teamId;
+    if (teamResult.isEmpty) {
+      // Get inviter name for team name
+      final invInfo = await _db.query('SELECT name FROM users WHERE id = @id', substitutionValues: {'id': inviterId});
+      final inviterName = invInfo.isNotEmpty ? (invInfo.first[0] as String) : 'Team';
+      final created = await _db.query('INSERT INTO teams (owner_id, name) VALUES (@owner, @name) RETURNING id', substitutionValues: {'owner': inviterId, 'name': "${inviterName}'s Team"});
+      teamId = created.first[0] as String;
+    } else {
+      teamId = teamResult.first[0] as String;
+    }
+
+    final mailerooUrl = Uri.parse('https://smtp.maileroo.com/api/v2/emails');
+    final mailerooHeaders = {'Content-Type': 'application/json', 'Authorization': 'Bearer ${Config.mailerooApiKey}'};
+
+    final results = <Map<String, dynamic>>[];
+
+    for (final email in emails) {
+      // basic email validation
+      if (!RegExp(r"^[^@\s]+@[^@\s]+\.[^@\s]+$").hasMatch(email)) {
+        results.add({'email': email, 'success': false, 'message': 'Invalid email.'});
+        continue;
+      }
+
+      // avoid duplicate invites to same email within 24 hours
+      final dupRes = await _db.query(
+        "SELECT COUNT(*) FROM invitations WHERE LOWER(email) = LOWER(@email) AND created_at > (now() - interval '1 day')",
+        substitutionValues: {'email': email},
+      );
+      final dupCount = (dupRes.isNotEmpty && dupRes.first.isNotEmpty) ? (dupRes.first[0] as int) : 0;
+      if (dupCount > 0) {
+        results.add({'email': email, 'success': false, 'message': 'An invitation was already sent to this email recently.'});
+        continue;
+      }
+
+      // Skip inviting self
+      final inviterEmailRow = await _db.query('SELECT email FROM users WHERE id = @id', substitutionValues: {'id': inviterId});
+      final inviterEmail = inviterEmailRow.isNotEmpty ? (inviterEmailRow.first[0] as String) : null;
+      if (inviterEmail != null && inviterEmail.toLowerCase() == email.toLowerCase()) {
+        results.add({'email': email, 'success': false, 'message': 'Cannot invite yourself.'});
+        continue;
+      }
+
+      // Check if user exists
+      final userRows = await _db.query('SELECT id, is_verified FROM users WHERE LOWER(email) = LOWER(@email)', substitutionValues: {'email': email});
+      String invitedUserId;
+      bool existed = false;
+      if (userRows.isEmpty) {
+        // create a placeholder account with random password and set verification token
+        final pwBytes = List<int>.generate(12, (_) => Random.secure().nextInt(256));
+        final randPw = base64Url.encode(pwBytes);
+        final hashed = BCrypt.hashpw(randPw, BCrypt.gensalt());
+        final tokenBytes = List<int>.generate(32, (_) => Random.secure().nextInt(256));
+        final inviteToken = base64Url.encode(tokenBytes);
+        final tokenExpiry = DateTime.now().add(const Duration(days: 7));
+
+        final inserted = await _db.query(
+          'INSERT INTO users (name, email, password_hash, verification_token, verification_token_expires_at) VALUES (@name, @email, @passwordHash, @token, @expiry) RETURNING id',
+          substitutionValues: {'name': '', 'email': email, 'passwordHash': hashed, 'token': inviteToken, 'expiry': tokenExpiry.toIso8601String()},
+        );
+        invitedUserId = inserted.first[0] as String;
+
+        // create invitation
+        await _db.query(
+          'INSERT INTO invitations (team_id, inviter_id, invited_user_id, email, invite_token, invite_token_expires_at) VALUES (@team, @inviter, @invited, @email, @token, @expiry)',
+          substitutionValues: {'team': teamId, 'inviter': inviterId, 'invited': invitedUserId, 'email': email, 'token': inviteToken, 'expiry': tokenExpiry.toIso8601String()},
+        );
+
+        // send invite email (will verify and add on accept)
+        final acceptUrl = '${Config.clientBaseUrl}/accept-invite?token=$inviteToken';
+        final emailHtmlBody = '''
+            <h1>You were invited to join a Klarto team</h1>
+            <p>You were invited by a Klarto user to join their team. An account has been created for you:</p>
+            <ul>
+              <li><strong>Email:</strong> $email</li>
+              <li><strong>Password:</strong> $randPw</li>
+            </ul>
+            <p>Please use these credentials to login, then click the link below to verify your account and accept the invitation (this will also add you to the team):</p>
+            <p><a href="$acceptUrl">Verify & Accept Invitation</a></p>
+            <p>This link will expire in 7 days. For security, change your password after logging in.</p>
+        ''';
+        final mailerooBody = json.encode({
+          'from': {'address': Config.mailerooSenderAddress, 'display_name': 'Klarto Team'},
+          'to': [{'address': email, 'display_name': ''}],
+          'subject': 'You were invited to join Klarto',
+          'html': emailHtmlBody,
+        });
+        try {
+          final resp = await http.post(mailerooUrl, headers: mailerooHeaders, body: mailerooBody);
+          if (resp.statusCode >= 200 && resp.statusCode < 300) {
+            results.add({'email': email, 'success': true, 'message': 'Invitation sent (account created).' });
+          } else {
+            results.add({'email': email, 'success': false, 'message': 'Failed to send email.'});
+          }
+        } catch (e) {
+          results.add({'email': email, 'success': false, 'message': 'Email send error.'});
+        }
+      } else {
+        // user exists
+        existed = true;
+        invitedUserId = userRows.first[0] as String;
+
+        // create invite record
+        final tokenBytes = List<int>.generate(32, (_) => Random.secure().nextInt(256));
+        final inviteToken = base64Url.encode(tokenBytes);
+        final tokenExpiry = DateTime.now().add(const Duration(days: 7));
+
+        await _db.query(
+          'INSERT INTO invitations (team_id, inviter_id, invited_user_id, email, invite_token, invite_token_expires_at) VALUES (@team, @inviter, @invited, @email, @token, @expiry)',
+          substitutionValues: {'team': teamId, 'inviter': inviterId, 'invited': invitedUserId, 'email': email, 'token': inviteToken, 'expiry': tokenExpiry.toIso8601String()},
+        );
+
+        final acceptUrl = '${Config.clientBaseUrl}/accept-invite?token=$inviteToken';
+        final emailHtmlBody = '''
+            <h1>Invitation to join a Klarto team</h1>
+            <p>You were invited by a Klarto user to join their team. Click the link below to accept the invitation and be added to the team:</p>
+            <p><a href="$acceptUrl">Accept Invitation</a></p>
+            <p>This link will expire in 7 days.</p>
+        ''';
+        final mailerooBody = json.encode({
+          'from': {'address': Config.mailerooSenderAddress, 'display_name': 'Klarto Team'},
+          'to': [{'address': email, 'display_name': ''}],
+          'subject': 'Invitation to join Klarto',
+          'html': emailHtmlBody,
+        });
+        try {
+          final resp = await http.post(mailerooUrl, headers: mailerooHeaders, body: mailerooBody);
+          if (resp.statusCode >= 200 && resp.statusCode < 300) {
+            results.add({'email': email, 'success': true, 'message': 'Invitation sent.' });
+          } else {
+            results.add({'email': email, 'success': false, 'message': 'Failed to send email.'});
+          }
+        } catch (e) {
+          results.add({'email': email, 'success': false, 'message': 'Email send error.'});
+        }
+      }
+    }
+
+    return Response.ok(json.encode({'results': results}), headers: {'Content-Type': 'application/json'});
+  } catch (e, st) {
+    print('Error in _inviteHandler: $e');
+    print(st);
+    return Response.internalServerError(body: 'An unexpected server error occurred.');
+  }
+}
+
+// Handler for invite acceptance: verifies user and adds to team, showing HTML response.
+Future<Response> _acceptInviteHandler(Request request) async {
+  try {
+    final token = request.url.queryParameters['token'];
+    if (token == null || token.isEmpty) {
+      return _generateHtmlResponse(title: 'Invalid Invite', message: 'No token provided.', isSuccess: false);
+    }
+
+    final rows = await _db.query('SELECT id, team_id, invited_user_id, email, invite_token_expires_at, status FROM invitations WHERE invite_token = @token', substitutionValues: {'token': token});
+    if (rows.isEmpty) return _generateHtmlResponse(title: 'Invalid or Expired', message: 'This invite is not valid.', isSuccess: false);
+
+    final inv = rows.first.toColumnMap();
+    final invitationId = inv['id'] as String;
+    final teamId = inv['team_id'] as String;
+    final invitedUserId = inv['invited_user_id'] as String?;
+    final email = inv['email'] as String;
+    final expiresAt = inv['invite_token_expires_at'] as DateTime?;
+    final status = inv['status'] as String?;
+
+    if (status == 'accepted') return _generateHtmlResponse(title: 'Already Accepted', message: 'This invitation was already accepted.', isSuccess: false);
+    if (expiresAt != null && expiresAt.isBefore(DateTime.now())) return _generateHtmlResponse(title: 'Expired', message: 'This invitation has expired.', isSuccess: false);
+
+    String userId = invitedUserId ?? '';
+    if (userId.isEmpty) {
+      // Try to find user by email
+      final u = await _db.query('SELECT id FROM users WHERE LOWER(email) = LOWER(@email)', substitutionValues: {'email': email});
+      if (u.isEmpty) return _generateHtmlResponse(title: 'User Not Found', message: 'No user account found for this invitation.', isSuccess: false);
+      userId = u.first[0] as String;
+    }
+
+    // Mark user verified
+    await _db.query('UPDATE users SET is_verified = true, verification_token = NULL, verification_token_expires_at = NULL WHERE id = @id', substitutionValues: {'id': userId});
+
+    // Add to team if not already
+    final exists = await _db.query('SELECT id FROM team_members WHERE team_id = @team AND user_id = @user', substitutionValues: {'team': teamId, 'user': userId});
+    if (exists.isEmpty) {
+      await _db.query('INSERT INTO team_members (team_id, user_id, role) VALUES (@team, @user, @role)', substitutionValues: {'team': teamId, 'user': userId, 'role': 'member'});
+    }
+
+    // Update invitation status
+    await _db.query('UPDATE invitations SET status = @status, accepted_at = @accepted WHERE id = @id', substitutionValues: {'status': 'accepted', 'accepted': DateTime.now().toIso8601String(), 'id': invitationId});
+
+    return _generateHtmlResponse(title: 'Invitation Accepted', message: 'Your account has been verified and you have been added to the team.', isSuccess: true);
+  } catch (e, st) {
+    print('Error in _acceptInviteHandler: $e');
+    print(st);
+    return _generateHtmlResponse(title: 'Server Error', message: 'An unexpected error occurred.', isSuccess: false);
+  }
+}
+
+// Public handler for invitees to set their password and receive a JWT.
+Future<Response> _setPasswordForInviteHandler(Request request) async {
+  try {
+    final bodyString = await request.readAsString();
+    final body = json.decode(bodyString) as Map<String, dynamic>;
+    final token = body['token'] as String?;
+    final password = body['password'] as String?;
+
+    if (token == null || token.isEmpty) return Response(400, body: json.encode({'message': 'Token is required.'}));
+    if (password == null || password.length < 8) return Response(400, body: json.encode({'message': 'Password must be at least 8 characters.'}));
+
+    // Find invitation
+    final invRows = await _db.query(
+      'SELECT id, team_id, invited_user_id, email, invite_token_expires_at, status FROM invitations WHERE invite_token = @token',
+      substitutionValues: {'token': token},
+    );
+
+    if (invRows.isEmpty) return Response(400, body: json.encode({'message': 'Invalid or expired invitation token.'}));
+
+    final inv = invRows.first.toColumnMap();
+    final invitationId = inv['id'] as String;
+    final teamId = inv['team_id'] as String;
+    String? invitedUserId = inv['invited_user_id'] as String?;
+    final email = inv['email'] as String;
+    final expiresAt = inv['invite_token_expires_at'] as DateTime?;
+    final status = inv['status'] as String?;
+
+    if (status == 'accepted') return Response(400, body: json.encode({'message': 'Invitation already accepted.'}));
+    if (expiresAt != null && expiresAt.isBefore(DateTime.now())) return Response(400, body: json.encode({'message': 'Invitation has expired.'}));
+
+    // Resolve user id
+    if (invitedUserId == null || invitedUserId.isEmpty) {
+      final u = await _db.query('SELECT id FROM users WHERE LOWER(email) = LOWER(@email)', substitutionValues: {'email': email});
+      if (u.isEmpty) return Response(400, body: json.encode({'message': 'No user account found for this invitation.'}));
+      invitedUserId = u.first[0] as String;
+    }
+
+    // Update user's password and mark verified
+    final hashed = BCrypt.hashpw(password, BCrypt.gensalt());
+    await _db.query('UPDATE users SET password_hash = @hash, is_verified = true, verification_token = NULL, verification_token_expires_at = NULL WHERE id = @id', substitutionValues: {'hash': hashed, 'id': invitedUserId});
+
+    // Add to team if not already
+    final exists = await _db.query('SELECT id FROM team_members WHERE team_id = @team AND user_id = @user', substitutionValues: {'team': teamId, 'user': invitedUserId});
+    if (exists.isEmpty) {
+      await _db.query('INSERT INTO team_members (team_id, user_id, role) VALUES (@team, @user, @role)', substitutionValues: {'team': teamId, 'user': invitedUserId, 'role': 'member'});
+    }
+
+    // Update invitation
+    await _db.query('UPDATE invitations SET status = @status, accepted_at = @accepted, invited_user_id = @uid WHERE id = @id', substitutionValues: {'status': 'accepted', 'accepted': DateTime.now().toIso8601String(), 'uid': invitedUserId, 'id': invitationId});
+
+    // Generate JWT
+    final jwtToken = JWT({'id': invitedUserId}).sign(SecretKey(Config.jwtSecret), expiresIn: const Duration(days: 7));
+
+    return Response.ok(json.encode({'token': jwtToken}), headers: {'Content-Type': 'application/json'});
+  } catch (e, st) {
+    print('Error in _setPasswordForInviteHandler: $e');
+    print(st);
+    return Response.internalServerError(body: json.encode({'message': 'Server error.'}));
   }
 }

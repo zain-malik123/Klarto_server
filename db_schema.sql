@@ -105,6 +105,47 @@ CREATE INDEX idx_users_email ON public.users USING btree (email);
 CREATE TRIGGER set_timestamp BEFORE UPDATE ON public.users FOR EACH ROW EXECUTE FUNCTION public.trigger_set_timestamp();
 
 
+-- Teams table
+CREATE TABLE public.teams (
+    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    owner_id uuid NOT NULL,
+    name character varying(255) NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL
+);
+
+ALTER TABLE public.teams OWNER TO klarto_api_user;
+
+-- Team members
+CREATE TABLE public.team_members (
+    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    team_id uuid NOT NULL,
+    user_id uuid NOT NULL,
+    role character varying(50) DEFAULT 'member' NOT NULL,
+    joined_at timestamp with time zone DEFAULT now() NOT NULL
+);
+
+ALTER TABLE public.team_members OWNER TO klarto_api_user;
+
+-- Invitations
+CREATE TABLE public.invitations (
+    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    team_id uuid NOT NULL,
+    inviter_id uuid NOT NULL,
+    invited_user_id uuid,
+    email character varying(255) NOT NULL,
+    invite_token character varying(255) NOT NULL,
+    invite_token_expires_at timestamp with time zone,
+    status character varying(50) DEFAULT 'pending',
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    accepted_at timestamp with time zone
+);
+
+ALTER TABLE public.invitations OWNER TO klarto_api_user;
+
+CREATE INDEX idx_invitations_token ON public.invitations USING btree (invite_token);
+
+
+
 --
 -- PostgreSQL database dump complete
 --
