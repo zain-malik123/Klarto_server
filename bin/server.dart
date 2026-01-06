@@ -11,9 +11,9 @@ import 'package:crypto/crypto.dart';
 import 'package:http/http.dart' as http;
 import 'package:klarto_server/config.dart';
 import 'package:dart_jsonwebtoken/dart_jsonwebtoken.dart';
-import 'package:shelf_multipart/shelf_multipart.dart';
 import 'package:shelf_static/shelf_static.dart';
 import 'package:path/path.dart' as p;
+// Removed multipart imports; upload now expects JSON with base64 data.
 
 const _corsHeaders = {
   'Access-Control-Allow-Origin': '*', // Allows any origin
@@ -95,7 +95,8 @@ final _privateRouter = Router()
   ..get('/todos', _getTodosHandler)
   ..get('/activities', _getActivitiesHandler)
   ..put('/profile', _updateProfileHandler)
-  ..post('/profile/avatar', _uploadAvatarHandler);
+  ..post('/profile/avatar', _uploadAvatarHandler)
+  ..get('/profile/avatar', _getAvatarHandler);
 
 
 // Handler for the signup request.
@@ -885,37 +886,30 @@ Future<Response> _uploadAvatarHandler(Request request) async {
     final userId = request.context['userId'] as String?;
     if (userId == null) return Response.forbidden('Not authorized.');
 
-    if (!request.isMultipart) {
-      return Response(400, body: json.encode({'message': 'Request must be multipart.'}));
-    }
+      // Accept JSON body containing the base64 data URI for the avatar.
+      // Expected body: { "avatar_base64": "data:<mime>;base64,<data>" }
+      final contentTypeHeader = request.headers['content-type'] ?? '';
+      String? profileBase64;
 
-    final uploadsDir = Directory('public/uploads');
-    if (!uploadsDir.existsSync()) {
-      uploadsDir.createSync(recursive: true);
-    }
-
-    String? imageUrl;
-
-    await for (final formData in request.multipartFormData) {
-      if (formData.name == 'avatar') {
-        final filename = '${userId}_${DateTime.now().millisecondsSinceEpoch}${p.extension(formData.filename ?? ".jpg")}';
-        final file = File(p.join(uploadsDir.path, filename));
-        
-        final ios = file.openWrite();
-        await ios.addStream(formData.part);
-        await ios.close();
-
-        imageUrl = '/uploads/$filename';
+      if (contentTypeHeader.contains('application/json')) {
+        final bodyString = await request.readAsString();
+        try {
+          final body = json.decode(bodyString) as Map<String, dynamic>;
+          profileBase64 = body['avatar_base64'] as String? ?? body['avatar'] as String?;
+        } catch (e) {
+          return Response(400, body: json.encode({'message': 'Invalid JSON body.'}));
+        }
+      } else {
+        return Response(400, body: json.encode({'message': 'Unsupported content type. Use application/json with avatar_base64 field.'}));
       }
-    }
 
-    if (imageUrl == null) {
-      return Response(400, body: json.encode({'message': 'No avatar image found in request.'}));
-    }
+      if (profileBase64 == null || profileBase64.isEmpty) {
+        return Response(400, body: json.encode({'message': 'No avatar_base64 found in request.'}));
+      }
 
     await _db.query(
-      'UPDATE users SET profile_picture_url = @url WHERE id = @id',
-      substitutionValues: {'url': imageUrl, 'id': userId},
+      'UPDATE users SET profile_picture_base64 = @b64 WHERE id = @id',
+      substitutionValues: {'b64': profileBase64, 'id': userId},
     );
 
     _logActivity(
@@ -926,7 +920,7 @@ Future<Response> _uploadAvatarHandler(Request request) async {
 
     return Response.ok(json.encode({
       'message': 'Avatar uploaded successfully.',
-      'profile_picture_url': imageUrl,
+      'profile_picture_base64': profileBase64,
     }), headers: {'Content-Type': 'application/json'});
 
   } catch (e, stackTrace) {
@@ -988,4 +982,31 @@ void main(List<String> args) async {
   final server = await io.serve(handler, Config.host, Config.port);
 
   print('Server listening at http://${server.address.host}:${server.port}');
+}
+
+// Handler to retrieve user's avatar (base64) from DB
+Future<Response> _getAvatarHandler(Request request) async {
+  try {
+    final userId = request.context['userId'] as String?;
+    if (userId == null) return Response.forbidden('Not authorized.');
+
+    final result = await _db.query(
+      'SELECT profile_picture_base64 FROM users WHERE id = @id',
+      substitutionValues: {'id': userId},
+    );
+
+    if (result.isEmpty) return Response.notFound(json.encode({'message': 'User not found.'}));
+
+    final row = result.first.toColumnMap();
+    final b64 = row['profile_picture_base64'] as String?;
+    if (b64 == null) {
+      return Response.notFound(json.encode({'message': 'No avatar found.'}));
+    }
+
+    return Response.ok(json.encode({'profile_picture_base64': b64}), headers: {'Content-Type': 'application/json'});
+  } catch (e, stackTrace) {
+    print('Error retrieving avatar: $e');
+    print(stackTrace);
+    return Response.internalServerError(body: 'An unexpected server error occurred.');
+  }
 }

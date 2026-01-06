@@ -260,12 +260,6 @@
       "languageVersion": "3.4"
     },
     {
-      "name": "shelf_multipart",
-      "rootUri": "file:///C:/Users/Khalid/AppData/Local/Pub/Cache/hosted/pub.dev/shelf_multipart-1.0.0",
-      "packageUri": "lib/",
-      "languageVersion": "2.12"
-    },
-    {
       "name": "shelf_packages_handler",
       "rootUri": "file:///C:/Users/Khalid/AppData/Local/Pub/Cache/hosted/pub.dev/shelf_packages_handler-3.0.2",
       "packageUri": "lib/",
