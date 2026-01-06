@@ -114,7 +114,7 @@ Future<Response> _signupHandler(Request request) async {
     final body = json.decode(bodyString) as Map<String, dynamic>;
 
     final name = body['name'] as String?;
-    final email = body['email'] as String?;
+    var email = body['email'] as String?;
     final password = body['password'] as String?;
 
     // 2. Validate the incoming data.
@@ -126,6 +126,9 @@ Future<Response> _signupHandler(Request request) async {
       );
     }
 
+
+    // Normalize email to lowercase for consistent, case-insensitive behavior.
+    email = email?.trim().toLowerCase();
 
     // Prevent creating a new account if an account or pending invitation already exists for this email.
     final existingUsers = await _db.query('SELECT id FROM users WHERE LOWER(email) = LOWER(@email)', substitutionValues: {'email': email});
@@ -237,16 +240,19 @@ Future<Response> _loginHandler(Request request) async {
     final bodyString = await request.readAsString();
     final body = json.decode(bodyString) as Map<String, dynamic>;
 
-    final email = body['email'] as String?;
+    var email = body['email'] as String?;
     final password = body['password'] as String?;
 
     if (email == null || password == null || email.isEmpty || password.isEmpty) {
       return Response(400, body: json.encode({'message': 'Email and password are required.'}));
     }
 
-    // 1. Find the user by email.
+    // Normalize email for case-insensitive matching
+    email = email?.trim().toLowerCase();
+
+    // 1. Find the user by email (case-insensitive).
     final result = await _db.query(
-      'SELECT id, password_hash, is_verified FROM users WHERE email = @email',
+      'SELECT id, password_hash, is_verified FROM users WHERE LOWER(email) = @email',
       substitutionValues: {'email': email},
     );
 
@@ -297,15 +303,17 @@ Future<Response> _requestPasswordResetHandler(Request request) async {
   try {
     final bodyString = await request.readAsString();
     final body = json.decode(bodyString) as Map<String, dynamic>;
-    final email = body['email'] as String?;
+    var email = body['email'] as String?;
 
     if (email == null || email.isEmpty) {
       return Response(400, body: json.encode({'message': 'Email is required.'}));
     }
 
-    // 1. Find user by email.
+    email = email.trim().toLowerCase();
+
+    // 1. Find user by email (case-insensitive).
     final result = await _db.query(
-      'SELECT id, name FROM users WHERE email = @email',
+      'SELECT id, name FROM users WHERE LOWER(email) = @email',
       substitutionValues: {'email': email},
     );
 
@@ -1193,8 +1201,9 @@ Future<Response> _inviteHandler(Request request) async {
     final results = <Map<String, dynamic>>[];
 
     for (final email in emails) {
+      final normEmail = email.trim().toLowerCase();
       // basic email validation
-      if (!RegExp(r"^[^@\s]+@[^@\s]+\.[^@\s]+$").hasMatch(email)) {
+      if (!RegExp(r"^[^@\s]+@[^@\s]+\.[^@\s]+$").hasMatch(normEmail)) {
         results.add({'email': email, 'success': false, 'message': 'Invalid email.'});
         continue;
       }
@@ -1202,7 +1211,7 @@ Future<Response> _inviteHandler(Request request) async {
       // avoid duplicate invites to same email within 24 hours
       final dupRes = await _db.query(
         "SELECT COUNT(*) FROM invitations WHERE LOWER(email) = LOWER(@email) AND created_at > (now() - interval '1 day')",
-        substitutionValues: {'email': email},
+        substitutionValues: {'email': normEmail},
       );
       final dupCount = (dupRes.isNotEmpty && dupRes.first.isNotEmpty) ? (dupRes.first[0] as int) : 0;
       if (dupCount > 0) {
@@ -1213,13 +1222,13 @@ Future<Response> _inviteHandler(Request request) async {
       // Skip inviting self
       final inviterEmailRow = await _db.query('SELECT email FROM users WHERE id = @id', substitutionValues: {'id': inviterId});
       final inviterEmail = inviterEmailRow.isNotEmpty ? (inviterEmailRow.first[0] as String) : null;
-      if (inviterEmail != null && inviterEmail.toLowerCase() == email.toLowerCase()) {
+      if (inviterEmail != null && inviterEmail.toLowerCase() == normEmail) {
         results.add({'email': email, 'success': false, 'message': 'Cannot invite yourself.'});
         continue;
       }
 
       // Check if user exists
-      final userRows = await _db.query('SELECT id, is_verified FROM users WHERE LOWER(email) = LOWER(@email)', substitutionValues: {'email': email});
+      final userRows = await _db.query('SELECT id, is_verified FROM users WHERE LOWER(email) = LOWER(@email)', substitutionValues: {'email': normEmail});
       String invitedUserId;
       bool existed = false;
       if (userRows.isEmpty) {
@@ -1233,14 +1242,14 @@ Future<Response> _inviteHandler(Request request) async {
 
         final inserted = await _db.query(
           'INSERT INTO users (name, email, password_hash, verification_token, verification_token_expires_at) VALUES (@name, @email, @passwordHash, @token, @expiry) RETURNING id',
-          substitutionValues: {'name': '', 'email': email, 'passwordHash': hashed, 'token': inviteToken, 'expiry': tokenExpiry.toIso8601String()},
+          substitutionValues: {'name': '', 'email': normEmail, 'passwordHash': hashed, 'token': inviteToken, 'expiry': tokenExpiry.toIso8601String()},
         );
         invitedUserId = inserted.first[0] as String;
 
         // create invitation
         await _db.query(
           'INSERT INTO invitations (team_id, inviter_id, invited_user_id, email, invite_token, invite_token_expires_at) VALUES (@team, @inviter, @invited, @email, @token, @expiry)',
-          substitutionValues: {'team': teamId, 'inviter': inviterId, 'invited': invitedUserId, 'email': email, 'token': inviteToken, 'expiry': tokenExpiry.toIso8601String()},
+          substitutionValues: {'team': teamId, 'inviter': inviterId, 'invited': invitedUserId, 'email': normEmail, 'token': inviteToken, 'expiry': tokenExpiry.toIso8601String()},
         );
 
         // send invite email (will verify and add on accept)
@@ -1283,7 +1292,7 @@ Future<Response> _inviteHandler(Request request) async {
 
         await _db.query(
           'INSERT INTO invitations (team_id, inviter_id, invited_user_id, email, invite_token, invite_token_expires_at) VALUES (@team, @inviter, @invited, @email, @token, @expiry)',
-          substitutionValues: {'team': teamId, 'inviter': inviterId, 'invited': invitedUserId, 'email': email, 'token': inviteToken, 'expiry': tokenExpiry.toIso8601String()},
+          substitutionValues: {'team': teamId, 'inviter': inviterId, 'invited': invitedUserId, 'email': normEmail, 'token': inviteToken, 'expiry': tokenExpiry.toIso8601String()},
         );
 
         final acceptUrl = '${Config.clientBaseUrl}/accept-invite?token=$inviteToken';
