@@ -279,6 +279,18 @@ Future<Response> _loginHandler(Request request) async {
     final jwt = JWT({'id': userId});
     final token = jwt.sign(SecretKey(Config.jwtSecret), expiresIn: const Duration(days: 7));
 
+    // Determine if this user joined via an accepted invitation
+    bool joinedViaInvite = false;
+    try {
+      final invResult = await _db.query(
+        "SELECT id FROM invitations WHERE invited_user_id = @userId AND status = 'accepted' LIMIT 1",
+        substitutionValues: {'userId': userId},
+      );
+      joinedViaInvite = invResult.isNotEmpty;
+    } catch (e) {
+      print('Error checking invitations for user $userId: $e');
+    }
+
     // Log the login activity
     _logActivity(
       userId: userId,
@@ -287,7 +299,7 @@ Future<Response> _loginHandler(Request request) async {
     );
 
     return Response.ok(
-      json.encode({'token': token}),
+      json.encode({'token': token, 'invited': joinedViaInvite}),
       headers: {'Content-Type': 'application/json'},
     );
 
