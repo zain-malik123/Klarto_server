@@ -12,9 +12,12 @@
         "dart_jsonwebtoken",
         "dotenv",
         "http",
+        "path",
         "postgres",
         "shelf",
-        "shelf_router"
+        "shelf_multipart",
+        "shelf_router",
+        "shelf_static"
       ],
       "devDependencies": [
         "lints",
@@ -56,6 +59,32 @@
       "name": "lints",
       "version": "2.1.1",
       "dependencies": []
+    },
+    {
+      "name": "path",
+      "version": "1.9.1",
+      "dependencies": []
+    },
+    {
+      "name": "shelf_static",
+      "version": "1.1.3",
+      "dependencies": [
+        "convert",
+        "http_parser",
+        "mime",
+        "path",
+        "shelf"
+      ]
+    },
+    {
+      "name": "shelf_multipart",
+      "version": "1.0.0",
+      "dependencies": [
+        "http_parser",
+        "mime",
+        "shelf",
+        "string_scanner"
+      ]
     },
     {
       "name": "dart_jsonwebtoken",
@@ -245,17 +274,6 @@
       ]
     },
     {
-      "name": "shelf_static",
-      "version": "1.1.3",
-      "dependencies": [
-        "convert",
-        "http_parser",
-        "mime",
-        "path",
-        "shelf"
-      ]
-    },
-    {
       "name": "shelf_packages_handler",
       "version": "3.0.2",
       "dependencies": [
@@ -271,11 +289,6 @@
         "async",
         "stack_trace"
       ]
-    },
-    {
-      "name": "path",
-      "version": "1.9.1",
-      "dependencies": []
     },
     {
       "name": "package_config",
@@ -373,6 +386,35 @@
       ]
     },
     {
+      "name": "mime",
+      "version": "1.0.6",
+      "dependencies": []
+    },
+    {
+      "name": "http_parser",
+      "version": "4.1.2",
+      "dependencies": [
+        "collection",
+        "source_span",
+        "string_scanner",
+        "typed_data"
+      ]
+    },
+    {
+      "name": "convert",
+      "version": "3.1.2",
+      "dependencies": [
+        "typed_data"
+      ]
+    },
+    {
+      "name": "string_scanner",
+      "version": "1.4.1",
+      "dependencies": [
+        "source_span"
+      ]
+    },
+    {
       "name": "clock",
       "version": "1.1.2",
       "dependencies": []
@@ -385,13 +427,6 @@
         "collection",
         "convert",
         "crypto"
-      ]
-    },
-    {
-      "name": "convert",
-      "version": "3.1.2",
-      "dependencies": [
-        "typed_data"
       ]
     },
     {
@@ -412,16 +447,6 @@
       "name": "meta",
       "version": "1.17.0",
       "dependencies": []
-    },
-    {
-      "name": "http_parser",
-      "version": "4.1.2",
-      "dependencies": [
-        "collection",
-        "source_span",
-        "string_scanner",
-        "typed_data"
-      ]
     },
     {
       "name": "args",
@@ -452,13 +477,6 @@
       "name": "http_methods",
       "version": "1.1.1",
       "dependencies": []
-    },
-    {
-      "name": "string_scanner",
-      "version": "1.4.1",
-      "dependencies": [
-        "source_span"
-      ]
     },
     {
       "name": "logging",
@@ -515,11 +533,6 @@
     {
       "name": "term_glyph",
       "version": "1.2.2",
-      "dependencies": []
-    },
-    {
-      "name": "mime",
-      "version": "2.0.0",
       "dependencies": []
     },
     {

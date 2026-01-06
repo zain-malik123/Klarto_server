@@ -67,7 +67,8 @@ CREATE TABLE public.users (
     verification_token character varying(255),
     verification_token_expires_at timestamp with time zone,
     password_reset_token character varying(255),
-    password_reset_token_expires_at timestamp with time zone
+    password_reset_token_expires_at timestamp with time zone,
+    profile_picture_url text
 );
 
 

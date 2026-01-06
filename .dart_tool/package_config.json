@@ -195,7 +195,7 @@
     },
     {
       "name": "mime",
-      "rootUri": "file:///C:/Users/Khalid/AppData/Local/Pub/Cache/hosted/pub.dev/mime-2.0.0",
+      "rootUri": "file:///C:/Users/Khalid/AppData/Local/Pub/Cache/hosted/pub.dev/mime-1.0.6",
       "packageUri": "lib/",
       "languageVersion": "3.2"
     },
@@ -258,6 +258,12 @@
       "rootUri": "file:///C:/Users/Khalid/AppData/Local/Pub/Cache/hosted/pub.dev/shelf-1.4.2",
       "packageUri": "lib/",
       "languageVersion": "3.4"
+    },
+    {
+      "name": "shelf_multipart",
+      "rootUri": "file:///C:/Users/Khalid/AppData/Local/Pub/Cache/hosted/pub.dev/shelf_multipart-1.0.0",
+      "packageUri": "lib/",
+      "languageVersion": "2.12"
     },
     {
       "name": "shelf_packages_handler",

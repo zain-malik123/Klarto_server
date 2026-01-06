@@ -11,6 +11,10 @@ import 'package:crypto/crypto.dart';
 import 'package:http/http.dart' as http;
 import 'package:klarto_server/config.dart';
 import 'package:dart_jsonwebtoken/dart_jsonwebtoken.dart';
+import 'package:shelf_multipart/shelf_multipart.dart';
+import 'package:shelf_static/shelf_static.dart';
+import 'package:path/path.dart' as p;
+
 const _corsHeaders = {
   'Access-Control-Allow-Origin': '*', // Allows any origin
   'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
@@ -89,9 +93,9 @@ final _privateRouter = Router()
   ..delete('/labels/<id>', _deleteLabelHandler)
   ..post('/todos', _createTodoHandler)
   ..get('/todos', _getTodosHandler)
-  ..get('/activities', _getActivitiesHandler);
-
-
+  ..get('/activities', _getActivitiesHandler)
+  ..put('/profile', _updateProfileHandler)
+  ..post('/profile/avatar', _uploadAvatarHandler);
 
 
 // Handler for the signup request.
@@ -842,6 +846,96 @@ Future<Response> _getActivitiesHandler(Request request) async {
   }
 }
 
+// Handler for updating user profile (name).
+Future<Response> _updateProfileHandler(Request request) async {
+  try {
+    final userId = request.context['userId'] as String?;
+    if (userId == null) return Response.forbidden('Not authorized.');
+
+    final bodyString = await request.readAsString();
+    final body = json.decode(bodyString) as Map<String, dynamic>;
+    final name = body['name'] as String?;
+
+    if (name == null || name.isEmpty) {
+      return Response(400, body: json.encode({'message': 'Name is required.'}));
+    }
+
+    await _db.query(
+      'UPDATE users SET name = @name WHERE id = @id',
+      substitutionValues: {'name': name, 'id': userId},
+    );
+
+    _logActivity(
+      userId: userId,
+      activityName: 'Update Profile',
+      description: 'User updated their name to: $name',
+    );
+
+    return Response.ok(json.encode({'message': 'Profile updated successfully.', 'name': name}), headers: {'Content-Type': 'application/json'});
+  } catch (e, stackTrace) {
+    print('Error updating profile: $e');
+    print(stackTrace);
+    return Response.internalServerError(body: 'An unexpected server error occurred.');
+  }
+}
+
+// Handler for uploading profile picture.
+Future<Response> _uploadAvatarHandler(Request request) async {
+  try {
+    final userId = request.context['userId'] as String?;
+    if (userId == null) return Response.forbidden('Not authorized.');
+
+    if (!request.isMultipart) {
+      return Response(400, body: json.encode({'message': 'Request must be multipart.'}));
+    }
+
+    final uploadsDir = Directory('public/uploads');
+    if (!uploadsDir.existsSync()) {
+      uploadsDir.createSync(recursive: true);
+    }
+
+    String? imageUrl;
+
+    await for (final formData in request.multipartFormData) {
+      if (formData.name == 'avatar') {
+        final filename = '${userId}_${DateTime.now().millisecondsSinceEpoch}${p.extension(formData.filename ?? ".jpg")}';
+        final file = File(p.join(uploadsDir.path, filename));
+        
+        final ios = file.openWrite();
+        await ios.addStream(formData.part);
+        await ios.close();
+
+        imageUrl = '/uploads/$filename';
+      }
+    }
+
+    if (imageUrl == null) {
+      return Response(400, body: json.encode({'message': 'No avatar image found in request.'}));
+    }
+
+    await _db.query(
+      'UPDATE users SET profile_picture_url = @url WHERE id = @id',
+      substitutionValues: {'url': imageUrl, 'id': userId},
+    );
+
+    _logActivity(
+      userId: userId,
+      activityName: 'Update Avatar',
+      description: 'User updated their profile picture.',
+    );
+
+    return Response.ok(json.encode({
+      'message': 'Avatar uploaded successfully.',
+      'profile_picture_url': imageUrl,
+    }), headers: {'Content-Type': 'application/json'});
+
+  } catch (e, stackTrace) {
+    print('Error uploading avatar: $e');
+    print(stackTrace);
+    return Response.internalServerError(body: 'An unexpected server error occurred.');
+  }
+}
+
 // Helper function to log user activities.
 Future<void> _logActivity({
   required String userId,
@@ -881,7 +975,10 @@ void main(List<String> args) async {
 
   // --- Server Setup ---
   // Combine public and private routes. Apply auth middleware only to private routes.
-  final cascade = Cascade().add(_publicRouter).add(_authMiddleware()(_privateRouter));
+  final cascade = Cascade()
+      .add(createStaticHandler('public'))
+      .add(_publicRouter)
+      .add(_authMiddleware()(_privateRouter));
 
   final handler = const Pipeline()
       .addMiddleware(logRequests()) // Log all incoming requests.
