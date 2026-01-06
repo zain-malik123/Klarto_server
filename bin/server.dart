@@ -1153,7 +1153,7 @@ Future<Response> _getAvatarHandler(Request request) async {
   }
 }
 
-// Handler to invite team members (max 3 emails). Creates accounts if missing and sends invite/accept links.
+// Handler to invite team members (max 5 emails). Creates accounts if missing and sends invite/accept links.
 Future<Response> _inviteHandler(Request request) async {
   try {
     final inviterId = request.context['userId'] as String?;
@@ -1170,7 +1170,7 @@ Future<Response> _inviteHandler(Request request) async {
     }
 
     if (emails.isEmpty) return Response(400, body: json.encode({'message': 'No emails provided.'}));
-    if (emails.length > 3) return Response(400, body: json.encode({'message': 'You can invite up to 3 members.'}));
+    if (emails.length > 5) return Response(400, body: json.encode({'message': 'You can invite up to 5 members.'}));
 
     // Rate-limit: prevent abuse by limiting invites per inviter to 10 per hour
     final recentCountRes = await _db.query(
