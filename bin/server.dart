@@ -102,6 +102,7 @@ final _privateRouter = Router()
   ..put('/profile', _updateProfileHandler)
   ..post('/profile/avatar', _uploadAvatarHandler)
   ..get('/profile/avatar', _getAvatarHandler)
+  ..get('/profile', _getProfileHandler)
   ..post('/team/invite', _inviteHandler)
   ..get('/team/invite/accept', _acceptInviteHandler);
 
@@ -1456,5 +1457,31 @@ Future<Response> _setPasswordForInviteHandler(Request request) async {
     print('Error in _setPasswordForInviteHandler: $e');
     print(st);
     return Response.internalServerError(body: json.encode({'message': 'Server error.'}));
+  }
+}
+
+// Handler to retrieve user's profile (name, email, avatar base64)
+Future<Response> _getProfileHandler(Request request) async {
+  try {
+    final userId = request.context['userId'] as String?;
+    if (userId == null) return Response.forbidden('Not authorized.');
+
+    final result = await _db.query(
+      'SELECT name, email, profile_picture_base64 FROM users WHERE id = @id',
+      substitutionValues: {'id': userId},
+    );
+
+    if (result.isEmpty) return Response.notFound(json.encode({'message': 'User not found.'}));
+
+    final row = result.first.toColumnMap();
+    return Response.ok(json.encode({
+      'name': row['name'],
+      'email': row['email'],
+      'profile_picture_base64': row['profile_picture_base64'],
+    }), headers: {'Content-Type': 'application/json'});
+  } catch (e, stackTrace) {
+    print('Error retrieving profile: $e');
+    print(stackTrace);
+    return Response.internalServerError(body: 'An unexpected server error occurred.');
   }
 }
