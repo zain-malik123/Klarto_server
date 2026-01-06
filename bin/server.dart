@@ -968,6 +968,18 @@ void main(List<String> args) async {
   print('Successfully connected to the database.');
 
   // --- Server Setup ---
+  // Ensure `public` and uploads directories exist (avoids runtime errors on servers without them).
+  final publicDir = Directory('public');
+  if (!publicDir.existsSync()) {
+    print('`public` directory not found. Creating `public`...');
+    publicDir.createSync(recursive: true);
+  }
+  final uploadsDir = Directory(p.join('public', 'uploads'));
+  if (!uploadsDir.existsSync()) {
+    print('`public/uploads` directory not found. Creating `public/uploads`...');
+    uploadsDir.createSync(recursive: true);
+  }
+
   // Combine public and private routes. Apply auth middleware only to private routes.
   final cascade = Cascade()
       .add(createStaticHandler('public'))
