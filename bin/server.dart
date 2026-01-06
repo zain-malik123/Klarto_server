@@ -126,6 +126,29 @@ Future<Response> _signupHandler(Request request) async {
       );
     }
 
+
+    // Prevent creating a new account if an account or pending invitation already exists for this email.
+    final existingUsers = await _db.query('SELECT id FROM users WHERE LOWER(email) = LOWER(@email)', substitutionValues: {'email': email});
+    if (existingUsers.isNotEmpty) {
+      return Response(
+        409,
+        body: json.encode({'message': 'An account with this email already exists. If you were invited, please use the invitation link to set your password.'}),
+        headers: {'Content-Type': 'application/json'},
+      );
+    }
+
+    final pendingInv = await _db.query(
+      "SELECT id FROM invitations WHERE LOWER(email) = LOWER(@email) AND status != 'accepted'",
+      substitutionValues: {'email': email},
+    );
+    if (pendingInv.isNotEmpty) {
+      return Response(
+        409,
+        body: json.encode({'message': 'There is a pending invitation for this email. Please use the invitation link to accept and set your password.'}),
+        headers: {'Content-Type': 'application/json'},
+      );
+    }
+
     // 3. Hash the password for security. NEVER store plain text passwords.
     final hashedPassword = BCrypt.hashpw(password, BCrypt.gensalt());
 
@@ -1223,15 +1246,14 @@ Future<Response> _inviteHandler(Request request) async {
         // send invite email (will verify and add on accept)
         final acceptUrl = '${Config.clientBaseUrl}/accept-invite?token=$inviteToken';
         final emailHtmlBody = '''
-            <h1>You were invited to join a Klarto team</h1>
-            <p>You were invited by a Klarto user to join their team. An account has been created for you:</p>
+            <h1>You're invited to join Klarto</h1>
+            <p>An invitation was created for this email address:</p>
             <ul>
               <li><strong>Email:</strong> $email</li>
-              <li><strong>Password:</strong> $randPw</li>
             </ul>
-            <p>Please use these credentials to login, then click the link below to verify your account and accept the invitation (this will also add you to the team):</p>
-            <p><a href="$acceptUrl">Verify & Accept Invitation</a></p>
-            <p>This link will expire in 7 days. For security, change your password after logging in.</p>
+            <p>No password has been set for your account yet. To set a password, verify your email, and accept the invitation, click the button below:</p>
+            <p><a href="$acceptUrl">Set password & Accept Invitation</a></p>
+            <p>This link will expire in 7 days. If you did not expect this invitation, you can safely ignore this email.</p>
         ''';
         final mailerooBody = json.encode({
           'from': {'address': Config.mailerooSenderAddress, 'display_name': 'Klarto Team'},
@@ -1266,10 +1288,10 @@ Future<Response> _inviteHandler(Request request) async {
 
         final acceptUrl = '${Config.clientBaseUrl}/accept-invite?token=$inviteToken';
         final emailHtmlBody = '''
-            <h1>Invitation to join a Klarto team</h1>
-            <p>You were invited by a Klarto user to join their team. Click the link below to accept the invitation and be added to the team:</p>
-            <p><a href="$acceptUrl">Accept Invitation</a></p>
-            <p>This link will expire in 7 days.</p>
+          <h1>Invitation to join Klarto</h1>
+          <p>You were invited to join a Klarto team. Click the button below to verify your email and accept the invitation. If you don't have a password yet, you'll be prompted to create one during the process.</p>
+          <p><a href="$acceptUrl">Verify & Accept Invitation</a></p>
+          <p>This link will expire in 7 days. If you did not request this, you may ignore this message.</p>
         ''';
         final mailerooBody = json.encode({
           'from': {'address': Config.mailerooSenderAddress, 'display_name': 'Klarto Team'},
