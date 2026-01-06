@@ -1182,15 +1182,22 @@ Future<Response> _inviteHandler(Request request) async {
       return Response(429, body: json.encode({'message': 'Invite rate limit exceeded. Try again later.'}));
     }
 
-    // Find or create a team for inviter
+    // Find or create a team for inviter.
+    // Prefer a team owned by the inviter; otherwise, if the inviter is a member of a team, use that team; if none, create a new team owned by inviter.
     var teamResult = await _db.query('SELECT id FROM teams WHERE owner_id = @owner', substitutionValues: {'owner': inviterId});
     String teamId;
     if (teamResult.isEmpty) {
-      // Get inviter name for team name
-      final invInfo = await _db.query('SELECT name FROM users WHERE id = @id', substitutionValues: {'id': inviterId});
-      final inviterName = invInfo.isNotEmpty ? (invInfo.first[0] as String) : 'Team';
-      final created = await _db.query('INSERT INTO teams (owner_id, name) VALUES (@owner, @name) RETURNING id', substitutionValues: {'owner': inviterId, 'name': "${inviterName}'s Team"});
-      teamId = created.first[0] as String;
+      // Not an owner of a team; check if inviter is a member of any team
+      final memberRes = await _db.query('SELECT team_id FROM team_members WHERE user_id = @user LIMIT 1', substitutionValues: {'user': inviterId});
+      if (memberRes.isNotEmpty) {
+        teamId = memberRes.first[0] as String;
+      } else {
+        // Get inviter name for team name
+        final invInfo = await _db.query('SELECT name FROM users WHERE id = @id', substitutionValues: {'id': inviterId});
+        final inviterName = invInfo.isNotEmpty ? (invInfo.first[0] as String) : 'Team';
+        final created = await _db.query('INSERT INTO teams (owner_id, name) VALUES (@owner, @name) RETURNING id', substitutionValues: {'owner': inviterId, 'name': "${inviterName}'s Team"});
+        teamId = created.first[0] as String;
+      }
     } else {
       teamId = teamResult.first[0] as String;
     }
