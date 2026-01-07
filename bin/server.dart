@@ -127,57 +127,6 @@ Future<Response> _signupHandler(Request request) async {
       );
     }
 
-    Future<Response> _checkMemberHandler(Request request) async {
-      try {
-        final userId = request.context['userId'] as String?;
-        if (userId == null) return Response.forbidden('Not authorized.');
-
-        final bodyString = await request.readAsString();
-        String? email;
-        try {
-          final body = json.decode(bodyString) as Map<String, dynamic>;
-          email = body['email'] as String?;
-        } catch (e) {
-          // If not JSON, try query param
-          email = request.url.queryParameters['email'];
-        }
-
-        if (email == null || email.isEmpty) return Response(400, body: json.encode({'message': 'Email is required.'}));
-
-        final normEmail = email.trim().toLowerCase();
-
-        // Determine inviter's team same as invite handler: prefer owned team, else member team
-        String? teamId;
-        final ownerRes = await _db.query('SELECT id FROM teams WHERE owner_id = @owner', substitutionValues: {'owner': userId});
-        if (ownerRes.isNotEmpty) {
-          teamId = ownerRes.first[0] as String;
-        } else {
-          final memberRes = await _db.query('SELECT team_id FROM team_members WHERE user_id = @user LIMIT 1', substitutionValues: {'user': userId});
-          if (memberRes.isNotEmpty) teamId = memberRes.first[0] as String;
-        }
-
-        if (teamId == null) {
-          return Response.ok(json.encode({'is_member': false}), headers: {'Content-Type': 'application/json'});
-        }
-
-        // Find user by email
-        final u = await _db.query('SELECT id FROM users WHERE LOWER(email) = LOWER(@email)', substitutionValues: {'email': normEmail});
-        if (u.isEmpty) {
-          return Response.ok(json.encode({'is_member': false}), headers: {'Content-Type': 'application/json'});
-        }
-        final otherUserId = u.first[0] as String;
-
-        final mem = await _db.query('SELECT id FROM team_members WHERE team_id = @team AND user_id = @user', substitutionValues: {'team': teamId, 'user': otherUserId});
-        final isMember = mem.isNotEmpty;
-
-        return Response.ok(json.encode({'is_member': isMember}), headers: {'Content-Type': 'application/json'});
-      } catch (e, st) {
-        print('Error in _checkMemberHandler: $e');
-        print(st);
-        return Response.internalServerError(body: json.encode({'message': 'Server error.'}));
-      }
-    }
-
     // Normalize email to lowercase for consistent, case-insensitive behavior.
     email = email?.trim().toLowerCase();
 
@@ -1542,5 +1491,52 @@ Future<Response> _getProfileHandler(Request request) async {
     print('Error retrieving profile: $e');
     print(stackTrace);
     return Response.internalServerError(body: 'An unexpected server error occurred.');
+  }
+}
+Future<Response> _checkMemberHandler(Request request) async {
+  try {
+    final userId = request.context['userId'] as String?;
+    if (userId == null) return Response.forbidden('Not authorized.');
+
+    final bodyString = await request.readAsString();
+    String? email;
+    try {
+      final body = json.decode(bodyString) as Map<String, dynamic>;
+      email = body['email'] as String?;
+    } catch (e) {
+      email = request.url.queryParameters['email'];
+    }
+
+    if (email == null || email.isEmpty) return Response(400, body: json.encode({'message': 'Email is required.'}));
+
+    final normEmail = email.trim().toLowerCase();
+
+    String? teamId;
+    final ownerRes = await _db.query('SELECT id FROM teams WHERE owner_id = @owner', substitutionValues: {'owner': userId});
+    if (ownerRes.isNotEmpty) {
+      teamId = ownerRes.first[0] as String;
+    } else {
+      final memberRes = await _db.query('SELECT team_id FROM team_members WHERE user_id = @user LIMIT 1', substitutionValues: {'user': userId});
+      if (memberRes.isNotEmpty) teamId = memberRes.first[0] as String;
+    }
+
+    if (teamId == null) {
+      return Response.ok(json.encode({'is_member': false}), headers: {'Content-Type': 'application/json'});
+    }
+
+    final u = await _db.query('SELECT id FROM users WHERE LOWER(email) = LOWER(@email)', substitutionValues: {'email': normEmail});
+    if (u.isEmpty) {
+      return Response.ok(json.encode({'is_member': false}), headers: {'Content-Type': 'application/json'});
+    }
+    final otherUserId = u.first[0] as String;
+
+    final mem = await _db.query('SELECT id FROM team_members WHERE team_id = @team AND user_id = @user', substitutionValues: {'team': teamId, 'user': otherUserId});
+    final isMember = mem.isNotEmpty;
+
+    return Response.ok(json.encode({'is_member': isMember}), headers: {'Content-Type': 'application/json'});
+  } catch (e, st) {
+    print('Error in _checkMemberHandler: \');
+    print(st);
+    return Response.internalServerError(body: json.encode({'message': 'Server error.'}));
   }
 }
