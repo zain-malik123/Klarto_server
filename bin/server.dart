@@ -1535,7 +1535,7 @@ Future<Response> _checkMemberHandler(Request request) async {
 
     return Response.ok(json.encode({'is_member': isMember}), headers: {'Content-Type': 'application/json'});
   } catch (e, st) {
-    print('Error in _checkMemberHandler: \');
+    print('Error in _checkMemberHandler: $e');
     print(st);
     return Response.internalServerError(body: json.encode({'message': 'Server error.'}));
   }
