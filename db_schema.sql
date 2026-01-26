@@ -2,7 +2,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict jBfICzkd4kAaqzjdWp5x7diZY5G7hzCvrsReVID1WI4IVISaTHutXXJPsxc9wFJ
+\restrict vQxm6cqrEEavU9Ukc7Lf1rxnhc99q22ffiNA4BrxYFRkyrqieH3LNJhZbCnO2gh
 
 -- Dumped from database version 13.23
 -- Dumped by pg_dump version 13.23
@@ -53,6 +53,214 @@ SET default_tablespace = '';
 SET default_table_access_method = heap;
 
 --
+-- Name: activities; Type: TABLE; Schema: public; Owner: klarto_api_user
+--
+
+CREATE TABLE public.activities (
+    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    user_id uuid NOT NULL,
+    activity_name character varying(255) NOT NULL,
+    description text,
+    created_at timestamp with time zone DEFAULT now() NOT NULL
+);
+
+
+ALTER TABLE public.activities OWNER TO klarto_api_user;
+
+--
+-- Name: comments; Type: TABLE; Schema: public; Owner: klarto_api_user
+--
+
+CREATE TABLE public.comments (
+    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    todo_id uuid NOT NULL,
+    user_id uuid NOT NULL,
+    text text NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL
+);
+
+
+ALTER TABLE public.comments OWNER TO klarto_api_user;
+
+--
+-- Name: filters; Type: TABLE; Schema: public; Owner: klarto_api_user
+--
+
+CREATE TABLE public.filters (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    user_id uuid NOT NULL,
+    name text NOT NULL,
+    query text NOT NULL,
+    color text NOT NULL,
+    is_favorite boolean DEFAULT false NOT NULL,
+    description text,
+    created_at timestamp with time zone DEFAULT now() NOT NULL
+);
+
+
+ALTER TABLE public.filters OWNER TO klarto_api_user;
+
+--
+-- Name: invitations; Type: TABLE; Schema: public; Owner: klarto_api_user
+--
+
+CREATE TABLE public.invitations (
+    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    team_id uuid NOT NULL,
+    inviter_id uuid NOT NULL,
+    invited_user_id uuid,
+    email character varying(255) NOT NULL,
+    invite_token character varying(255) NOT NULL,
+    invite_token_expires_at timestamp with time zone,
+    status character varying(50) DEFAULT 'pending'::character varying,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    accepted_at timestamp with time zone
+);
+
+
+ALTER TABLE public.invitations OWNER TO klarto_api_user;
+
+--
+-- Name: labels; Type: TABLE; Schema: public; Owner: klarto_api_user
+--
+
+CREATE TABLE public.labels (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    name text NOT NULL,
+    color text,
+    user_id uuid,
+    team_id uuid,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    is_favorite boolean DEFAULT false NOT NULL
+);
+
+
+ALTER TABLE public.labels OWNER TO klarto_api_user;
+
+--
+-- Name: notes; Type: TABLE; Schema: public; Owner: klarto_api_user
+--
+
+CREATE TABLE public.notes (
+    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    user_id uuid NOT NULL,
+    type character varying(20) DEFAULT 'text'::character varying NOT NULL,
+    content text,
+    media_url text,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    media_base64 text
+);
+
+
+ALTER TABLE public.notes OWNER TO klarto_api_user;
+
+--
+-- Name: projects; Type: TABLE; Schema: public; Owner: klarto_api_user
+--
+
+CREATE TABLE public.projects (
+    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    owner_id uuid NOT NULL,
+    name character varying(255) NOT NULL,
+    color character varying(50),
+    access_type character varying(20) DEFAULT 'everyone'::character varying NOT NULL,
+    team_id uuid,
+    is_favorite boolean DEFAULT false NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL
+);
+
+
+ALTER TABLE public.projects OWNER TO klarto_api_user;
+
+--
+-- Name: sub_todos; Type: TABLE; Schema: public; Owner: klarto_api_user
+--
+
+CREATE TABLE public.sub_todos (
+    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    todo_id uuid NOT NULL,
+    title text NOT NULL,
+    is_completed boolean DEFAULT false NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    description text,
+    due_date date,
+    due_time time without time zone,
+    priority integer,
+    label_id uuid
+);
+
+
+ALTER TABLE public.sub_todos OWNER TO klarto_api_user;
+
+--
+-- Name: team_members; Type: TABLE; Schema: public; Owner: klarto_api_user
+--
+
+CREATE TABLE public.team_members (
+    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    team_id uuid NOT NULL,
+    user_id uuid NOT NULL,
+    role character varying(50) DEFAULT 'member'::character varying NOT NULL,
+    joined_at timestamp with time zone DEFAULT now() NOT NULL
+);
+
+
+ALTER TABLE public.team_members OWNER TO klarto_api_user;
+
+--
+-- Name: teams; Type: TABLE; Schema: public; Owner: klarto_api_user
+--
+
+CREATE TABLE public.teams (
+    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    owner_id uuid NOT NULL,
+    name character varying(255) NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL
+);
+
+
+ALTER TABLE public.teams OWNER TO klarto_api_user;
+
+--
+-- Name: todo_labels; Type: TABLE; Schema: public; Owner: klarto_api_user
+--
+
+CREATE TABLE public.todo_labels (
+    todo_id uuid NOT NULL,
+    label_id uuid NOT NULL
+);
+
+
+ALTER TABLE public.todo_labels OWNER TO klarto_api_user;
+
+--
+-- Name: todos; Type: TABLE; Schema: public; Owner: klarto_api_user
+--
+
+CREATE TABLE public.todos (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    title text NOT NULL,
+    description text,
+    due_date timestamp with time zone,
+    completed boolean DEFAULT false NOT NULL,
+    priority integer DEFAULT 0,
+    repeat_rule text,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    user_id uuid NOT NULL,
+    team_id uuid,
+    project_id uuid,
+    label_id uuid,
+    project_name text,
+    due_time text,
+    repeat_value text,
+    is_completed boolean DEFAULT false
+);
+
+
+ALTER TABLE public.todos OWNER TO klarto_api_user;
+
+--
 -- Name: users; Type: TABLE; Schema: public; Owner: klarto_api_user
 --
 
@@ -68,12 +276,92 @@ CREATE TABLE public.users (
     verification_token_expires_at timestamp with time zone,
     password_reset_token character varying(255),
     password_reset_token_expires_at timestamp with time zone,
-    profile_picture_url text,
-    profile_picture_base64 text
+    profile_picture_base64 text,
+    has_completed_onboarding boolean DEFAULT false NOT NULL
 );
 
 
 ALTER TABLE public.users OWNER TO klarto_api_user;
+
+--
+-- Name: activities activities_pkey; Type: CONSTRAINT; Schema: public; Owner: klarto_api_user
+--
+
+ALTER TABLE ONLY public.activities
+    ADD CONSTRAINT activities_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: comments comments_pkey; Type: CONSTRAINT; Schema: public; Owner: klarto_api_user
+--
+
+ALTER TABLE ONLY public.comments
+    ADD CONSTRAINT comments_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: filters filters_pkey; Type: CONSTRAINT; Schema: public; Owner: klarto_api_user
+--
+
+ALTER TABLE ONLY public.filters
+    ADD CONSTRAINT filters_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: labels labels_pkey; Type: CONSTRAINT; Schema: public; Owner: klarto_api_user
+--
+
+ALTER TABLE ONLY public.labels
+    ADD CONSTRAINT labels_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: notes notes_pkey; Type: CONSTRAINT; Schema: public; Owner: klarto_api_user
+--
+
+ALTER TABLE ONLY public.notes
+    ADD CONSTRAINT notes_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: sub_todos sub_todos_pkey; Type: CONSTRAINT; Schema: public; Owner: klarto_api_user
+--
+
+ALTER TABLE ONLY public.sub_todos
+    ADD CONSTRAINT sub_todos_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: team_members team_members_pkey; Type: CONSTRAINT; Schema: public; Owner: klarto_api_user
+--
+
+ALTER TABLE ONLY public.team_members
+    ADD CONSTRAINT team_members_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: teams teams_pkey; Type: CONSTRAINT; Schema: public; Owner: klarto_api_user
+--
+
+ALTER TABLE ONLY public.teams
+    ADD CONSTRAINT teams_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: todo_labels todo_labels_pkey; Type: CONSTRAINT; Schema: public; Owner: klarto_api_user
+--
+
+ALTER TABLE ONLY public.todo_labels
+    ADD CONSTRAINT todo_labels_pkey PRIMARY KEY (todo_id, label_id);
+
+
+--
+-- Name: todos todos_pkey; Type: CONSTRAINT; Schema: public; Owner: klarto_api_user
+--
+
+ALTER TABLE ONLY public.todos
+    ADD CONSTRAINT todos_pkey PRIMARY KEY (id);
+
 
 --
 -- Name: users users_email_key; Type: CONSTRAINT; Schema: public; Owner: klarto_api_user
@@ -92,6 +380,76 @@ ALTER TABLE ONLY public.users
 
 
 --
+-- Name: idx_activities_user; Type: INDEX; Schema: public; Owner: klarto_api_user
+--
+
+CREATE INDEX idx_activities_user ON public.activities USING btree (user_id);
+
+
+--
+-- Name: idx_filters_user_id; Type: INDEX; Schema: public; Owner: klarto_api_user
+--
+
+CREATE INDEX idx_filters_user_id ON public.filters USING btree (user_id);
+
+
+--
+-- Name: idx_invitations_token; Type: INDEX; Schema: public; Owner: klarto_api_user
+--
+
+CREATE INDEX idx_invitations_token ON public.invitations USING btree (invite_token);
+
+
+--
+-- Name: idx_team_members_team; Type: INDEX; Schema: public; Owner: klarto_api_user
+--
+
+CREATE INDEX idx_team_members_team ON public.team_members USING btree (team_id);
+
+
+--
+-- Name: idx_team_members_user; Type: INDEX; Schema: public; Owner: klarto_api_user
+--
+
+CREATE INDEX idx_team_members_user ON public.team_members USING btree (user_id);
+
+
+--
+-- Name: idx_todos_due_date; Type: INDEX; Schema: public; Owner: klarto_api_user
+--
+
+CREATE INDEX idx_todos_due_date ON public.todos USING btree (due_date);
+
+
+--
+-- Name: idx_todos_label_id; Type: INDEX; Schema: public; Owner: klarto_api_user
+--
+
+CREATE INDEX idx_todos_label_id ON public.todos USING btree (label_id);
+
+
+--
+-- Name: idx_todos_project_id; Type: INDEX; Schema: public; Owner: klarto_api_user
+--
+
+CREATE INDEX idx_todos_project_id ON public.todos USING btree (project_id);
+
+
+--
+-- Name: idx_todos_team_id; Type: INDEX; Schema: public; Owner: klarto_api_user
+--
+
+CREATE INDEX idx_todos_team_id ON public.todos USING btree (team_id);
+
+
+--
+-- Name: idx_todos_user_id; Type: INDEX; Schema: public; Owner: klarto_api_user
+--
+
+CREATE INDEX idx_todos_user_id ON public.todos USING btree (user_id);
+
+
+--
 -- Name: idx_users_email; Type: INDEX; Schema: public; Owner: klarto_api_user
 --
 
@@ -105,64 +463,57 @@ CREATE INDEX idx_users_email ON public.users USING btree (email);
 CREATE TRIGGER set_timestamp BEFORE UPDATE ON public.users FOR EACH ROW EXECUTE FUNCTION public.trigger_set_timestamp();
 
 
--- Teams table
-CREATE TABLE public.teams (
-    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
-    owner_id uuid NOT NULL,
-    name character varying(255) NOT NULL,
-    created_at timestamp with time zone DEFAULT now() NOT NULL
-);
+--
+-- Name: filters fk_filters_user; Type: FK CONSTRAINT; Schema: public; Owner: klarto_api_user
+--
 
-ALTER TABLE public.teams OWNER TO klarto_api_user;
+ALTER TABLE ONLY public.filters
+    ADD CONSTRAINT fk_filters_user FOREIGN KEY (user_id) REFERENCES public.users(id) ON DELETE CASCADE;
 
--- Team members
-CREATE TABLE public.team_members (
-    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
-    team_id uuid NOT NULL,
-    user_id uuid NOT NULL,
-    role character varying(50) DEFAULT 'member' NOT NULL,
-    joined_at timestamp with time zone DEFAULT now() NOT NULL
-);
 
-ALTER TABLE public.team_members OWNER TO klarto_api_user;
+--
+-- Name: todos fk_todos_label; Type: FK CONSTRAINT; Schema: public; Owner: klarto_api_user
+--
 
--- Invitations
-CREATE TABLE public.invitations (
-    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
-    team_id uuid NOT NULL,
-    inviter_id uuid NOT NULL,
-    invited_user_id uuid,
-    email character varying(255) NOT NULL,
-    invite_token character varying(255) NOT NULL,
-    invite_token_expires_at timestamp with time zone,
-    status character varying(50) DEFAULT 'pending',
-    created_at timestamp with time zone DEFAULT now() NOT NULL,
-    accepted_at timestamp with time zone
-);
+ALTER TABLE ONLY public.todos
+    ADD CONSTRAINT fk_todos_label FOREIGN KEY (label_id) REFERENCES public.labels(id) ON DELETE SET NULL;
 
-ALTER TABLE public.invitations OWNER TO klarto_api_user;
 
--- Projects
-CREATE TABLE public.projects (
-    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
-    owner_id uuid NOT NULL,
-    name character varying(255) NOT NULL,
-    color character varying(50),
-    access_type character varying(20) DEFAULT 'everyone' NOT NULL, -- everyone, team
-    team_id uuid, -- NULL if everyone
-    is_favorite boolean DEFAULT false NOT NULL,
-    created_at timestamp with time zone DEFAULT now() NOT NULL
-);
+--
+-- Name: todos fk_todos_team; Type: FK CONSTRAINT; Schema: public; Owner: klarto_api_user
+--
 
-ALTER TABLE public.projects OWNER TO klarto_api_user;
+ALTER TABLE ONLY public.todos
+    ADD CONSTRAINT fk_todos_team FOREIGN KEY (team_id) REFERENCES public.teams(id) ON DELETE SET NULL;
 
-CREATE INDEX idx_invitations_token ON public.invitations USING btree (invite_token);
 
+--
+-- Name: todos fk_todos_user; Type: FK CONSTRAINT; Schema: public; Owner: klarto_api_user
+--
+
+ALTER TABLE ONLY public.todos
+    ADD CONSTRAINT fk_todos_user FOREIGN KEY (user_id) REFERENCES public.users(id) ON DELETE CASCADE;
+
+
+--
+-- Name: todo_labels todo_labels_label_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: klarto_api_user
+--
+
+ALTER TABLE ONLY public.todo_labels
+    ADD CONSTRAINT todo_labels_label_id_fkey FOREIGN KEY (label_id) REFERENCES public.labels(id) ON DELETE CASCADE;
+
+
+--
+-- Name: todo_labels todo_labels_todo_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: klarto_api_user
+--
+
+ALTER TABLE ONLY public.todo_labels
+    ADD CONSTRAINT todo_labels_todo_id_fkey FOREIGN KEY (todo_id) REFERENCES public.todos(id) ON DELETE CASCADE;
 
 
 --
 -- PostgreSQL database dump complete
 --
 
-\unrestrict jBfICzkd4kAaqzjdWp5x7diZY5G7hzCvrsReVID1WI4IVISaTHutXXJPsxc9wFJ
+\unrestrict vQxm6cqrEEavU9Ukc7Lf1rxnhc99q22ffiNA4BrxYFRkyrqieH3LNJhZbCnO2gh
 

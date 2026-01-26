@@ -67,6 +67,29 @@ Future<Response> _getInvitedMembersHandler(Request request) async {
   }
 }
 
+Future<Response> _deleteProjectHandler(Request request, String id) async {
+  try {
+    final userId = request.context['userId'] as String?;
+    if (userId == null) return Response.forbidden('Not authorized.');
+
+    // 1. Delete associated todos
+    await _db.query('DELETE FROM todos WHERE project_id = @id::uuid', substitutionValues: {'id': id});
+    
+    // 2. Delete project
+    final res = await _db.query('DELETE FROM projects WHERE id = @id::uuid AND owner_id = @owner::uuid', substitutionValues: {'id': id, 'owner': userId});
+
+    if (res.affectedRowCount == 0) {
+      return Response(404, body: json.encode({'message': 'Project not found or not owned by user.'}), headers: {'Content-Type': 'application/json'});
+    }
+
+    return Response.ok(json.encode({'success': true, 'message': 'Project deleted.'}), headers: {'Content-Type': 'application/json'});
+  } catch (e, st) {
+    print('Error in _deleteProjectHandler: $e');
+    print(st);
+    return Response.internalServerError(body: json.encode({'message': 'Server error.'}), headers: {'Content-Type': 'application/json'});
+  }
+}
+
 // Handler to return all users (available members) — authenticated.
 Future<Response> _getAllUsersHandler(Request request) async {
   try {
@@ -110,11 +133,16 @@ Future<Response> _getTeamMembersHandler(Request request) async {
     if (teamId == null) return Response.ok(json.encode([]), headers: {'Content-Type': 'application/json'});
 
     final rows = await _db.query(r'''
-      SELECT tm.id AS membership_id, u.id AS user_id, u.name, u.email, tm.role, u.profile_picture_base64, tm.joined_at
+      SELECT 'owner' AS role, u.id AS user_id, u.name, u.email, u.profile_picture_base64, t.created_at AS joined_at
+      FROM teams t
+      JOIN users u ON u.id = t.owner_id
+      WHERE t.id = @team
+      UNION ALL
+      SELECT tm.role, u.id AS user_id, u.name, u.email, u.profile_picture_base64, tm.joined_at
       FROM team_members tm
       JOIN users u ON u.id = tm.user_id
-      WHERE tm.team_id = @team
-      ORDER BY tm.joined_at ASC
+      WHERE tm.team_id = @team AND tm.user_id NOT IN (SELECT owner_id FROM teams WHERE id = @team)
+      ORDER BY joined_at ASC
     ''', substitutionValues: {'team': teamId});
 
     final members = rows.map((r) {
@@ -142,13 +170,25 @@ Future<Response> _addMemberHandler(Request request) async {
     final email = (body['email'] as String?)?.trim().toLowerCase();
     if (email == null || email.isEmpty) return Response(400, body: json.encode({'message': 'Email is required.'}), headers: {'Content-Type': 'application/json'});
 
-    // If request includes a `team_name`, create a new team owned by inviter and use it.
+    // If request includes a `team_name`, find or create a team owned by inviter.
     String? teamId;
     final requestedTeamName = (body['team_name'] as String?)?.trim();
     if (requestedTeamName != null && requestedTeamName.isNotEmpty) {
-      final created = await _db.query('INSERT INTO teams (owner_id, name) VALUES (@owner, @name) RETURNING id', substitutionValues: {'owner': inviterId, 'name': requestedTeamName});
-      teamId = created.first[0] as String;
-      print('Team created: id=$teamId name="$requestedTeamName" owner=$inviterId');
+      // Check if a team with this name already exists for this owner
+      final existing = await _db.query(
+        'SELECT id FROM teams WHERE owner_id = @owner AND LOWER(name) = LOWER(@name)',
+        substitutionValues: {'owner': inviterId, 'name': requestedTeamName},
+      );
+      if (existing.isNotEmpty) {
+        teamId = existing.first[0] as String;
+      } else {
+        final created = await _db.query(
+          'INSERT INTO teams (owner_id, name) VALUES (@owner, @name) RETURNING id',
+          substitutionValues: {'owner': inviterId, 'name': requestedTeamName},
+        );
+        teamId = created.first[0] as String;
+        print('Team created: id=$teamId name="$requestedTeamName" owner=$inviterId');
+      }
     } else {
       // Resolve existing team id for inviter (owner preferred)
       final ownerRes = await _db.query('SELECT id FROM teams WHERE owner_id = @owner', substitutionValues: {'owner': inviterId});
@@ -210,19 +250,24 @@ Future<Response> _getTeamsHandler(Request request) async {
     if (userId == null) return Response.forbidden('Not authorized.');
 
     final rows = await _db.query(r'''
-      SELECT t.id, t.name, t.owner_id, u.name AS owner_name
+      SELECT DISTINCT t.id, t.name, t.owner_id, u.name AS owner_name
       FROM teams t
       JOIN users u ON u.id = t.owner_id
-      WHERE t.owner_id = @userId OR t.id IN (SELECT team_id FROM team_members WHERE user_id = @userId)
-      ORDER BY LOWER(t.name) ASC
+      WHERE t.owner_id = @userId::uuid OR t.id IN (SELECT team_id FROM team_members WHERE user_id = @userId::uuid)
+      ORDER BY t.name ASC
     ''', substitutionValues: {'userId': userId});
 
-    final teams = rows.map((r) => r.toColumnMap()).toList();
+    final teams = rows.map((r) {
+      final map = r.toColumnMap();
+      // Ensure all values are JSON serializable (UUIDs to String)
+      return map.map((key, value) => MapEntry(key, value?.toString()));
+    }).toList();
+    
     return Response.ok(json.encode(teams), headers: {'Content-Type': 'application/json'});
   } catch (e, st) {
     print('Error in _getTeamsHandler: $e');
     print(st);
-    return Response.internalServerError(body: json.encode({'message': 'Server error.'}), headers: {'Content-Type': 'application/json'});
+    return Response.internalServerError(body: json.encode({'message': 'Server error: $e'}), headers: {'Content-Type': 'application/json'});
   }
 }
 
@@ -233,18 +278,40 @@ Future<Response> _getProjectsHandler(Request request) async {
     if (userId == null) return Response.forbidden('Not authorized.');
 
     // Projects where owner = userId OR access_type = 'everyone' OR user is in projects.team_id
+    // joined_count includes all team members plus the team owner, ensuring no double counting.
     final rows = await _db.query(r'''
-      SELECT p.*
+      SELECT p.*,
+        (SELECT COUNT(*) FROM team_members tm WHERE tm.team_id = p.team_id) +
+        (CASE 
+          WHEN p.team_id IS NOT NULL 
+          AND NOT EXISTS (
+            SELECT 1 FROM team_members tm2 
+            WHERE tm2.team_id = p.team_id 
+            AND tm2.user_id = (SELECT owner_id FROM teams WHERE id = p.team_id)
+          ) 
+          THEN 1 
+          ELSE 0 
+        END) AS joined_count,
+        (SELECT COUNT(*) FROM invitations i WHERE i.team_id = p.team_id AND i.status = 'pending') as pending_count
       FROM projects p
-      WHERE p.owner_id = @userId 
+      WHERE p.owner_id = @userId::uuid 
          OR p.access_type = 'everyone'
-         OR (p.access_type = 'team' AND p.team_id IN (SELECT team_id FROM team_members WHERE user_id = @userId))
+         OR (p.access_type = 'team' AND p.team_id IN (SELECT team_id FROM team_members WHERE user_id = @userId::uuid))
       ORDER BY p.created_at DESC
     ''', substitutionValues: {'userId': userId});
 
     final projects = rows.map((r) {
       final m = r.toColumnMap();
-      if (m['created_at'] is DateTime) m['created_at'] = (m['created_at'] as DateTime).toIso8601String();
+      for (final key in m.keys.toList()) {
+        final val = m[key];
+        if (val is DateTime) {
+          m[key] = val.toIso8601String();
+        } else if (val is BigInt) {
+          m[key] = val.toInt();
+        } else if (val != null && val is! String && val is! int && val is! double && val is! bool) {
+          m[key] = val.toString();
+        }
+      }
       return m;
     }).toList();
 
@@ -376,7 +443,9 @@ final _publicRouter = Router()
   ..post('/auth/request-password-reset', _requestPasswordResetHandler)
   ..post('/auth/reset-password', _resetPasswordHandler)
   // Internal test endpoint to send a test email using SMTP/app password.
-  ..post('/internal/send-test-email', _sendTestEmailHandler);
+  ..post('/internal/send-test-email', _sendTestEmailHandler)
+  ..get('/activities', _getActivitiesHandler)
+  ..post('/activities', _saveActivityHandler);
 
 // Public endpoint for invitees to set their password using the invite token.
 final _publicInviteRouter = Router()
@@ -394,11 +463,11 @@ final _privateRouter = Router()
   ..post('/todos', _createTodoHandler)
   ..get('/todos', _getTodosHandler)
   ..patch('/todos/<id>', _updateTodoHandler)
-  ..get('/activities', _getActivitiesHandler)
   ..put('/profile', _updateProfileHandler)
   ..post('/profile/avatar', _uploadAvatarHandler)
   ..get('/profile/avatar', _getAvatarHandler)
   ..get('/profile', _getProfileHandler)
+  ..post('/complete-onboarding', _completeOnboardingHandler)
   ..post('/team/invite', _inviteHandler)
   ..get('/team/invite/accept', _acceptInviteHandler)
   ..post('/team/check-member', _checkMemberHandler)
@@ -406,9 +475,19 @@ final _privateRouter = Router()
   ..get('/users', _getAllUsersHandler)
   ..get('/team/members', _getTeamMembersHandler)
   ..get('/teams', _getTeamsHandler)
+  ..post('/teams', _createTeamHandler)
+  ..delete('/team/<name>', _deleteTeamHandler)
   ..post('/team/add-member', _addMemberHandler)
   ..get('/projects', _getProjectsHandler)
-  ..post('/projects', _createProjectHandler);
+  ..post('/projects', _createProjectHandler)
+  ..delete('/projects/<id>', _deleteProjectHandler)
+  ..get('/notes', _getNotesHandler)
+  ..post('/notes', _addNoteHandler)
+  ..post('/todos/comments', _addCommentHandler)
+  ..get('/todos/<id>/comments', _getCommentsHandler)
+  ..post('/todos/sub-todos', _addSubTodoHandler)
+  ..get('/todos/<id>/sub-todos', _getSubTodosHandler)
+  ..patch('/todos/sub-todos/<id>/toggle', _toggleSubTodoHandler);
 
 // Handler for the signup request.
 Future<Response> _signupHandler(Request request) async {
@@ -661,7 +740,7 @@ Future<Response> _loginHandler(Request request) async {
 
     // 1. Find the user by email (case-insensitive).
     final result = await _db.query(
-      'SELECT id, password_hash, is_verified FROM users WHERE LOWER(email) = @email',
+      'SELECT id, password_hash, is_verified, has_completed_onboarding FROM users WHERE LOWER(email) = @email',
       substitutionValues: {'email': email},
     );
 
@@ -673,6 +752,7 @@ Future<Response> _loginHandler(Request request) async {
     final userId = user[0] as String;
     final storedHash = user[1] as String;
     final isVerified = user[2] as bool;
+    final hasCompletedOnboarding = user[3] as bool;
 
     // 2. Check if the account is verified.
     if (!isVerified) {
@@ -708,7 +788,12 @@ Future<Response> _loginHandler(Request request) async {
     );
 
     return Response.ok(
-      json.encode({'token': token, 'invited': joinedViaInvite}),
+      json.encode({
+        'token': token,
+        'user_id': userId,
+        'invited': joinedViaInvite,
+        'has_completed_onboarding': hasCompletedOnboarding,
+      }),
       headers: {'Content-Type': 'application/json'},
     );
 
@@ -1227,6 +1312,7 @@ Future<Response> _getTodosHandler(Request request) async {
     // due_today, overdue, this_week, high_priority, low_priority, completed
     final filter = request.url.queryParameters['filter']?.trim().toLowerCase();
     final clientDateStr = request.url.queryParameters['date']?.trim();
+    final projectId = request.url.queryParameters['project_id']?.trim();
 
     // If the client provided a date (YYYY-MM-DD), use that for comparisons
     // to avoid server timezone issues. Otherwise fall back to CURRENT_DATE.
@@ -1237,8 +1323,12 @@ Future<Response> _getTodosHandler(Request request) async {
         l.name as label_name, l.color as label_color
       FROM todos t
       LEFT JOIN labels l ON t.label_id = l.id
-      WHERE t.user_id = @userId
+      WHERE t.user_id = @userId::uuid
     ''';
+
+    if (projectId != null && projectId.isNotEmpty) {
+      baseQuery += " AND t.project_id = @projectId::uuid";
+    }
 
     // Append filter-specific conditions
     final dateExpr = hasClientDate ? "DATE(@clientDate)" : "CURRENT_DATE";
@@ -1265,23 +1355,30 @@ Future<Response> _getTodosHandler(Request request) async {
 
     baseQuery += " ORDER BY t.created_at DESC";
 
-    final substitutionValues = {'userId': userId};
+    final substitutionValues = <String, dynamic>{'userId': userId};
     if (hasClientDate) substitutionValues['clientDate'] = clientDateStr;
+    if (projectId != null && projectId.isNotEmpty) substitutionValues['projectId'] = projectId;
 
     final result = await _db.query(baseQuery, substitutionValues: substitutionValues);
 
     final todos = result.map((row) {
-      final map = row.toColumnMap();
-      // Convert date/time objects to strings for JSON compatibility
-      map['created_at'] = (map['created_at'] as DateTime).toIso8601String();
-      if (map['due_date'] is DateTime) {
-        map['due_date'] = (map['due_date'] as DateTime).toIso8601String().substring(0, 10);
+      final map = <String, dynamic>{};
+      for (var i = 0 ; i < result.columnDescriptions.length; i++) {
+        map[result.columnDescriptions[i].columnName] = row[i];
       }
-      // Add handling for due_time, which is also not directly JSON serializable.
-      if (map['due_time'] != null && map['due_time'] is! String) {
-        map['due_time'] = map['due_time'].toString();
-      }
-      return map;
+      // Ensure all values are JSON serializable
+      return map.map((key, value) {
+        if (value is DateTime) {
+          if (key == 'due_date') {
+            return MapEntry(key, value.toIso8601String().substring(0, 10));
+          }
+          return MapEntry(key, value.toIso8601String());
+        }
+        if (value != null && value is! String && value is! int && value is! double && value is! bool) {
+          return MapEntry(key, value.toString());
+        }
+        return MapEntry(key, value);
+      });
     }).toList();
 
     return Response.ok(json.encode(todos), headers: {'Content-Type': 'application/json'});
@@ -1313,11 +1410,7 @@ Future<Response> _updateTodoHandler(Request request, String id) async {
     final List<String> setClauses = [];
 
     if (body.containsKey('is_completed')) {
-      final isCompleted = body['is_completed'] as bool?;
-      if (currentlyCompleted == true && isCompleted == false) {
-        return Response(400, body: json.encode({'message': 'Completed todos cannot be reopened.'}), headers: {'Content-Type': 'application/json'});
-      }
-      updates['isCompleted'] = isCompleted;
+      updates['isCompleted'] = body['is_completed'] as bool?;
       setClauses.add('is_completed = @isCompleted');
     }
 
@@ -1331,13 +1424,38 @@ Future<Response> _updateTodoHandler(Request request, String id) async {
       setClauses.add('description = @description');
     }
 
+    if (body.containsKey('due_date')) {
+      updates['dueDate'] = body['due_date'];
+      setClauses.add('due_date = @dueDate');
+    }
+
+    if (body.containsKey('priority')) {
+      updates['priority'] = body['priority'];
+      setClauses.add('priority = @priority');
+    }
+
+    if (body.containsKey('label_id')) {
+      updates['labelId'] = body['label_id'];
+      setClauses.add('label_id = @labelId::uuid');
+    }
+
+    if (body.containsKey('project_name')) {
+      updates['projectName'] = body['project_name'];
+      setClauses.add('project_name = @projectName');
+    }
+
+    if (body.containsKey('project_id')) {
+      updates['projectId'] = body['project_id'];
+      setClauses.add('project_id = @projectId::uuid');
+    }
+
     if (setClauses.isEmpty) {
       return Response(400, body: json.encode({'message': 'No valid fields provided for update.'}), headers: {'Content-Type': 'application/json'});
     }
 
     updates['id'] = id;
     updates['userId'] = userId;
-    final query = 'UPDATE todos SET ${setClauses.join(', ')}, updated_at = NOW() WHERE id = @id AND user_id = @userId RETURNING *';
+    final query = 'UPDATE todos SET ${setClauses.join(', ')}, updated_at = NOW() WHERE id = @id::uuid AND user_id = @userId::uuid RETURNING *';
 
     final result = await _db.query(query, substitutionValues: updates);
 
@@ -1513,9 +1631,13 @@ Response _generateHtmlResponse({required String title, required String message, 
 // Handler for getting all activities for a user.
 Future<Response> _getActivitiesHandler(Request request) async {
   try {
-    final userId = request.context['userId'] as String?;
+    final queryParams = request.url.queryParameters;
+    final userId = queryParams['user_id'];
+
     if (userId == null) {
-      return Response.forbidden('Not authorized.');
+      return Response.badRequest(
+          body: json.encode({'error': 'user_id is required'}),
+          headers: {'Content-Type': 'application/json'});
     }
 
     // Join with users table to get the user's name for the activity log
@@ -1526,7 +1648,7 @@ Future<Response> _getActivitiesHandler(Request request) async {
         u.name as user_name 
       FROM activities a
       JOIN users u ON a.user_id = u.id
-      WHERE u.id = @userId -- For now, just fetching the current user's activities.
+      WHERE u.id = @userId::uuid 
       ORDER BY a.created_at DESC
       ''',
       substitutionValues: {'userId': userId},
@@ -1543,6 +1665,37 @@ Future<Response> _getActivitiesHandler(Request request) async {
     print('Error getting activities: $e');
     print(stackTrace);
     return Response.internalServerError(body: 'An unexpected server error occurred while fetching activities.');
+  }
+}
+
+Future<Response> _saveActivityHandler(Request request) async {
+  try {
+    final body = await request.readAsString();
+    final data = json.decode(body);
+    final userId = data['user_id'];
+    final activityName = data['activity_name'];
+    final description = data['description'];
+
+    if (userId == null || activityName == null || description == null) {
+      return Response.badRequest(
+          body: json.encode({'error': 'user_id, activity_name, and description are required'}),
+          headers: {'Content-Type': 'application/json'});
+    }
+
+    await _logActivity(
+      userId: userId,
+      activityName: activityName,
+      description: description,
+    );
+
+    return Response.ok(json.encode({'success': true}),
+        headers: {'Content-Type': 'application/json'});
+  } catch (e, st) {
+    print('Error in _saveActivityHandler: $e');
+    print(st);
+    return Response.internalServerError(
+        body: json.encode({'message': 'Server error: $e'}),
+        headers: {'Content-Type': 'application/json'});
   }
 }
 
@@ -1662,7 +1815,7 @@ Future<void> _logActivity({
     await _db.query(
       r'''
       INSERT INTO activities (user_id, activity_name, description)
-      VALUES (@userId, @activityName, @description)
+      VALUES (@userId::uuid, @activityName, @description)
       ''',
       substitutionValues: {
         'userId': userId,
@@ -1673,6 +1826,144 @@ Future<void> _logActivity({
   } catch (e) {
     // Log the error to the console but don't let it fail the main API request.
     print('Error logging activity: $e');
+  }
+}
+
+// Handler to create a new team with a list of initial members.
+Future<Response> _createTeamHandler(Request request) async {
+  try {
+    final userId = request.context['userId'] as String?;
+    if (userId == null) return Response.forbidden('Not authorized.');
+
+    final bodyString = await request.readAsString();
+    final body = json.decode(bodyString) as Map<String, dynamic>;
+    final teamName = (body['name'] as String?)?.trim();
+    final memberEmails = (body['members'] as List<dynamic>?) ?? [];
+
+    if (teamName == null || teamName.isEmpty) {
+      return Response(400, body: json.encode({'message': 'Team name is required.'}), headers: {'Content-Type': 'application/json'});
+    }
+
+    // 1. Create the team
+    final teamRes = await _db.query(
+      'INSERT INTO teams (owner_id, name) VALUES (@owner::uuid, @name) RETURNING id',
+      substitutionValues: {'owner': userId, 'name': teamName},
+    );
+    final teamId = teamRes.first[0].toString();
+
+    // 2. Add members
+    for (final emailObj in memberEmails) {
+      final email = emailObj.toString().trim().toLowerCase();
+      if (email.isEmpty) continue;
+
+      final u = await _db.query('SELECT id FROM users WHERE LOWER(email) = LOWER(@email)', substitutionValues: {'email': email});
+      if (u.isNotEmpty) {
+        final memberUserId = u.first[0].toString();
+        // Don't add owner to team_members specifically if they are already identified as owner in team retrieval
+        if (memberUserId != userId) {
+          await _db.query(
+            'INSERT INTO team_members (team_id, user_id, role) VALUES (@team::uuid, @user::uuid, @role) ON CONFLICT DO NOTHING',
+            substitutionValues: {'team': teamId, 'user': memberUserId, 'role': 'member'},
+          );
+        }
+      }
+    }
+
+    return Response.ok(json.encode({'success': true, 'teamId': teamId, 'name': teamName}), headers: {'Content-Type': 'application/json'});
+  } catch (e, st) {
+    print('Error in _createTeamHandler: $e');
+    print(st);
+    return Response.internalServerError(body: json.encode({'message': 'Server error.'}), headers: {'Content-Type': 'application/json'});
+  }
+}
+
+// Handler to delete a team by name (requested by current owner).
+Future<Response> _deleteTeamHandler(Request request, String name) async {
+  try {
+    final userId = request.context['userId'] as String?;
+    if (userId == null) return Response.forbidden('Not authorized.');
+
+    // Only allow owner to delete the team.
+    final teamRes = await _db.query(
+      'SELECT id FROM teams WHERE owner_id = @owner AND name = @name',
+      substitutionValues: {'owner': userId, 'name': Uri.decodeComponent(name)},
+    );
+
+    if (teamRes.isEmpty) {
+      return Response.notFound(json.encode({'message': 'Team not found or you are not the owner.'}));
+    }
+
+    final teamId = teamRes.first[0] as String;
+
+    // Delete members, invitations, projects, and finally the team.
+    await _db.query('DELETE FROM team_members WHERE team_id = @id', substitutionValues: {'id': teamId});
+    await _db.query('DELETE FROM invitations WHERE team_id = @id', substitutionValues: {'id': teamId});
+    // Optional: Delete projects associated with this team? 
+    // Usually it's better to keep them or reassign. For now, let's just clear team_id from projects.
+    await _db.query('UPDATE projects SET team_id = NULL, access_type = \'everyone\' WHERE team_id = @id', substitutionValues: {'id': teamId});
+    await _db.query('DELETE FROM teams WHERE id = @id', substitutionValues: {'id': teamId});
+
+    return Response.ok(json.encode({'success': true, 'message': 'Team deleted successfully.'}), headers: {'Content-Type': 'application/json'});
+  } catch (e, st) {
+    print('Error in _deleteTeamHandler: $e');
+    print(st);
+    return Response.internalServerError(body: json.encode({'message': 'Server error.'}));
+  }
+}
+
+// Handler to retrieve notes for the current user.
+Future<Response> _getNotesHandler(Request request) async {
+  try {
+    final userId = request.context['userId'] as String?;
+    if (userId == null) return Response.forbidden('Not authorized.');
+
+    final rows = await _db.query(
+      'SELECT id, type, content, media_base64, created_at FROM notes WHERE user_id = @userId ORDER BY created_at ASC',
+      substitutionValues: {'userId': userId},
+    );
+
+    final notes = rows.map((r) {
+      final m = r.toColumnMap();
+      if (m['created_at'] is DateTime) m['created_at'] = (m['created_at'] as DateTime).toIso8601String();
+      return m;
+    }).toList();
+
+    return Response.ok(json.encode(notes), headers: {'Content-Type': 'application/json'});
+  } catch (e, st) {
+    print('Error in _getNotesHandler: $e');
+    print(st);
+    return Response.internalServerError(body: json.encode({'message': 'Server error.'}));
+  }
+}
+
+// Handler to add a new note (text, image, or audio).
+Future<Response> _addNoteHandler(Request request) async {
+  try {
+    final userId = request.context['userId'] as String?;
+    if (userId == null) return Response.forbidden('Not authorized.');
+
+    final bodyString = await request.readAsString();
+    final body = json.decode(bodyString) as Map<String, dynamic>;
+
+    final type = body['type'] as String? ?? 'text'; // text, image, audio
+    final content = body['content'] as String? ?? '';
+    final mediaBase64 = body['media_base64'] as String?; // Base64 data
+
+    await _db.query(
+      'INSERT INTO notes (user_id, type, content, media_base64) VALUES (@user, @type, @content, @media)',
+      substitutionValues: {
+        'user': userId,
+        'type': type,
+        'content': content,
+        'media': mediaBase64,
+      },
+    );
+
+    return Response.ok(json.encode({'success': true}), headers: {'Content-Type': 'application/json'});
+  } catch (e, st) {
+    print('Error in _addNoteHandler: $e');
+    print(st);
+    return Response.internalServerError(body: json.encode({'message': 'Server error.'}));
   }
 }
 
@@ -1693,8 +1984,12 @@ void main(List<String> args) async {
   // may not have been applied). This creates the `projects` table if missing.
   try {
     await _ensureProjectsTable();
+    await _ensureOnboardingColumn();
+    await _ensureNotesTable();
+    await _ensureCommentsTable();
+    await _ensureSubTodosTable();
   } catch (e, st) {
-    print('Error ensuring projects table exists: $e');
+    print('Error ensuring database schema is up to date: $e');
     print(st);
   }
   print('Successfully connected to the database.');
@@ -2055,7 +2350,7 @@ Future<Response> _getProfileHandler(Request request) async {
     if (userId == null) return Response.forbidden('Not authorized.');
 
     final result = await _db.query(
-      'SELECT name, email, profile_picture_base64 FROM users WHERE id = @id',
+      'SELECT name, email, profile_picture_base64, has_completed_onboarding FROM users WHERE id = @id',
       substitutionValues: {'id': userId},
     );
 
@@ -2066,9 +2361,32 @@ Future<Response> _getProfileHandler(Request request) async {
       'name': row['name'],
       'email': row['email'],
       'profile_picture_base64': row['profile_picture_base64'],
+      'has_completed_onboarding': row['has_completed_onboarding'],
     }), headers: {'Content-Type': 'application/json'});
   } catch (e, stackTrace) {
     print('Error retrieving profile: $e');
+    print(stackTrace);
+    return Response.internalServerError(body: 'An unexpected server error occurred.');
+  }
+}
+
+// Handler to mark onboarding as completed for a user.
+Future<Response> _completeOnboardingHandler(Request request) async {
+  try {
+    final userId = request.context['userId'] as String?;
+    if (userId == null) return Response.forbidden('Not authorized.');
+
+    await _db.query(
+      'UPDATE users SET has_completed_onboarding = true WHERE id = @id',
+      substitutionValues: {'id': userId},
+    );
+
+    return Response.ok(
+      json.encode({'success': true, 'message': 'Onboarding marked as completed.'}),
+      headers: {'Content-Type': 'application/json'},
+    );
+  } catch (e, stackTrace) {
+    print('Error completing onboarding: $e');
     print(stackTrace);
     return Response.internalServerError(body: 'An unexpected server error occurred.');
   }
@@ -2096,6 +2414,285 @@ Future<void> _ensureProjectsTable() async {
     rethrow;
   }
 }
+
+// Add the missing `has_completed_onboarding` column to the `users` table if it doesn't exist.
+Future<void> _ensureOnboardingColumn() async {
+  try {
+    await _db.query(r"""
+      DO $$
+      BEGIN
+        IF NOT EXISTS (SELECT 1 FROM information_schema.columns 
+                       WHERE table_name='users' AND column_name='has_completed_onboarding') THEN
+          ALTER TABLE users ADD COLUMN has_completed_onboarding BOOLEAN DEFAULT FALSE NOT NULL;
+        END IF;
+      END
+      $$;
+    """);
+    print('Ensured `has_completed_onboarding` column exists in `users` table.');
+  } catch (e, st) {
+    print('Failed to ensure onboarding column: $e');
+    print(st);
+    rethrow;
+  }
+}
+
+Future<void> _ensureNotesTable() async {
+  try {
+    await _db.query(r"""
+      CREATE TABLE IF NOT EXISTS public.notes (
+          id uuid DEFAULT public.uuid_generate_v4() PRIMARY KEY,
+          user_id uuid NOT NULL,
+          type character varying(20) DEFAULT 'text' NOT NULL,
+          content text,
+          media_url text, -- Keep for backwards compatibility or optional file storage
+          media_base64 text, -- For storing data directly as base64
+          created_at timestamp with time zone DEFAULT now() NOT NULL
+      );
+    """);
+    // Ensure media_base64 column exists if table was already created
+    await _db.query(r"""
+      DO $$
+      BEGIN
+        IF NOT EXISTS (SELECT 1 FROM information_schema.columns 
+                       WHERE table_name='notes' AND column_name='media_base64') THEN
+          ALTER TABLE notes ADD COLUMN media_base64 TEXT;
+        END IF;
+      END
+      $$;
+    """);
+    print('Ensured `notes` table exists and has media_base64.');
+  } catch (e, st) {
+    print('Failed to ensure notes table: $e');
+    print(st);
+    rethrow;
+  }
+}
+
+Future<void> _ensureCommentsTable() async {
+  try {
+    await _db.query(r"""
+      CREATE TABLE IF NOT EXISTS public.comments (
+          id uuid DEFAULT public.uuid_generate_v4() PRIMARY KEY,
+          todo_id uuid NOT NULL,
+          user_id uuid NOT NULL,
+          text text NOT NULL,
+          created_at timestamp with time zone DEFAULT now() NOT NULL
+      );
+    """);
+    print('Ensured `comments` table exists.');
+  } catch (e, st) {
+    print('Failed to ensure comments table: $e');
+    print(st);
+    rethrow;
+  }
+}
+
+Future<void> _ensureSubTodosTable() async {
+  try {
+    await _db.query(r"""
+      CREATE TABLE IF NOT EXISTS public.sub_todos (
+          id uuid DEFAULT public.uuid_generate_v4() PRIMARY KEY,
+          todo_id uuid NOT NULL,
+          title text NOT NULL,
+          description text,
+          due_date date,
+          due_time time without time zone,
+          priority integer,
+          label_id uuid,
+          is_completed boolean DEFAULT false NOT NULL,
+          created_at timestamp with time zone DEFAULT now() NOT NULL
+      );
+    """);
+
+    // Add missing columns if table already existed
+    await _db.query(r"""
+      DO $$
+      BEGIN
+        IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='sub_todos' AND column_name='description') THEN
+          ALTER TABLE sub_todos ADD COLUMN description TEXT;
+        END IF;
+        IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='sub_todos' AND column_name='due_date') THEN
+          ALTER TABLE sub_todos ADD COLUMN due_date DATE;
+        END IF;
+        IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='sub_todos' AND column_name='due_time') THEN
+          ALTER TABLE sub_todos ADD COLUMN due_time TIME WITHOUT TIME ZONE;
+        END IF;
+        IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='sub_todos' AND column_name='priority') THEN
+          ALTER TABLE sub_todos ADD COLUMN priority INTEGER;
+        END IF;
+        IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='sub_todos' AND column_name='label_id') THEN
+          ALTER TABLE sub_todos ADD COLUMN label_id UUID;
+        END IF;
+      END
+      $$;
+    """);
+    print('Ensured `sub_todos` table and columns exist.');
+  } catch (e, st) {
+    print('Failed to ensure sub_todos table: $e');
+    print(st);
+    rethrow;
+  }
+}
+
+Future<Response> _addSubTodoHandler(Request request) async {
+  try {
+    final userId = request.context['userId'] as String?;
+    if (userId == null) return Response.forbidden('Not authorized.');
+
+    final body = json.decode(await request.readAsString()) as Map<String, dynamic>;
+    final todoId = body['todo_id'] as String?;
+    final title = body['title'] as String?;
+    final description = body['description'] as String?;
+    final dueDate = body['due_date'] as String?;
+    final dueTime = body['due_time'] as String?;
+    final priority = body['priority'] as int?;
+    final labelId = body['label_id'] as String?;
+
+    if (todoId == null || title == null || title.trim().isEmpty) {
+      return Response(400, body: json.encode({'message': 'todo_id and title are required.'}));
+    }
+
+    await _db.query(r"""
+      INSERT INTO sub_todos (todo_id, title, description, due_date, due_time, priority, label_id)
+      VALUES (@todoId::uuid, @title, @description, @dueDate, @dueTime, @priority, @labelId::uuid)
+    """, substitutionValues: {
+      'todoId': todoId,
+      'title': title,
+      'description': description,
+      'dueDate': dueDate,
+      'dueTime': dueTime,
+      'priority': priority,
+      'labelId': labelId,
+    });
+
+    return Response.ok(json.encode({'success': true, 'message': 'Sub-to do added.'}));
+  } catch (e, st) {
+    print('Error in _addSubTodoHandler: $e');
+    print(st);
+    return Response.internalServerError(body: json.encode({'message': 'Server error.'}));
+  }
+}
+
+Future<Response> _getSubTodosHandler(Request request, String todoId) async {
+  try {
+    final userId = request.context['userId'] as String?;
+    if (userId == null) return Response.forbidden('Not authorized.');
+
+    final rows = await _db.query(r"""
+      SELECT st.id, st.title, st.description, st.due_date, st.due_time, st.priority, st.label_id, st.is_completed, st.created_at, l.name as label_name, l.color as label_color
+      FROM sub_todos st
+      LEFT JOIN labels l ON l.id = st.label_id
+      WHERE st.todo_id = @todoId::uuid
+      ORDER BY st.created_at ASC
+    """, substitutionValues: {'todoId': todoId});
+
+    final subTodos = rows.map((r) {
+      // Manually build map to avoid JSArray issues with toColumnMap in some environments
+      final Map<String, dynamic> m = {};
+      for (var i = 0; i < rows.columnDescriptions.length; i++) {
+        m[rows.columnDescriptions[i].columnName] = r[i];
+      }
+      
+      if (m['created_at'] is DateTime) m['created_at'] = (m['created_at'] as DateTime).toIso8601String();
+      if (m['due_date'] is DateTime) {
+        final dt = m['due_date'] as DateTime;
+        m['due_date'] = "${dt.year}-${dt.month.toString().padLeft(2, '0')}-${dt.day.toString().padLeft(2, '0')}";
+      }
+      // Ensure UUIDs and other fields are strings, not objects or lists
+      m['id'] = m['id']?.toString();
+      m['todo_id'] = m['todo_id']?.toString();
+      m['label_id'] = m['label_id']?.toString();
+      
+      return m;
+    }).toList();
+
+    return Response.ok(json.encode(subTodos), headers: {'Content-Type': 'application/json'});
+  } catch (e, st) {
+    print('Error in _getSubTodosHandler: $e');
+    print(st);
+    return Response.internalServerError(body: json.encode({'message': 'Server error.'}));
+  }
+}
+
+Future<Response> _toggleSubTodoHandler(Request request, String id) async {
+  try {
+    final userId = request.context['userId'] as String?;
+    if (userId == null) return Response.forbidden('Not authorized.');
+
+    final body = json.decode(await request.readAsString()) as Map<String, dynamic>;
+    final isCompleted = body['is_completed'] as bool?;
+
+    if (isCompleted == null) {
+      return Response(400, body: json.encode({'message': 'is_completed is required.'}));
+    }
+
+    await _db.query(r"""
+      UPDATE sub_todos
+      SET is_completed = @isCompleted
+      WHERE id = @id::uuid
+    """, substitutionValues: {'id': id, 'isCompleted': isCompleted});
+
+    return Response.ok(json.encode({'success': true, 'message': 'Sub-to do updated.'}));
+  } catch (e, st) {
+    print('Error in _toggleSubTodoHandler: $e');
+    print(st);
+    return Response.internalServerError(body: json.encode({'message': 'Server error.'}));
+  }
+}
+
+Future<Response> _addCommentHandler(Request request) async {
+  try {
+    final userId = request.context['userId'] as String?;
+    if (userId == null) return Response.forbidden('Not authorized.');
+
+    final body = json.decode(await request.readAsString()) as Map<String, dynamic>;
+    final todoId = body['todo_id'] as String?;
+    final text = body['text'] as String?;
+
+    if (todoId == null || text == null || text.trim().isEmpty) {
+      return Response(400, body: json.encode({'message': 'todo_id and text are required.'}));
+    }
+
+    await _db.query(r"""
+      INSERT INTO comments (todo_id, user_id, text)
+      VALUES (@todoId::uuid, @userId::uuid, @text)
+    """, substitutionValues: {'todoId': todoId, 'userId': userId, 'text': text});
+
+    return Response.ok(json.encode({'success': true, 'message': 'Comment added.'}));
+  } catch (e, st) {
+    print('Error in _addCommentHandler: $e');
+    print(st);
+    return Response.internalServerError(body: json.encode({'message': 'Server error.'}));
+  }
+}
+
+Future<Response> _getCommentsHandler(Request request, String todoId) async {
+  try {
+    final userId = request.context['userId'] as String?;
+    if (userId == null) return Response.forbidden('Not authorized.');
+
+    final rows = await _db.query(r"""
+      SELECT c.id, c.text, c.created_at, u.name as author_name
+      FROM comments c
+      JOIN users u ON u.id = c.user_id
+      WHERE c.todo_id = @todoId::uuid
+      ORDER BY c.created_at ASC
+    """, substitutionValues: {'todoId': todoId});
+
+    final comments = rows.map((r) {
+      final m = r.toColumnMap();
+      if (m['created_at'] is DateTime) m['created_at'] = (m['created_at'] as DateTime).toIso8601String();
+      return m;
+    }).toList();
+
+    return Response.ok(json.encode(comments), headers: {'Content-Type': 'application/json'});
+  } catch (e, st) {
+    print('Error in _getCommentsHandler: $e');
+    print(st);
+    return Response.internalServerError(body: json.encode({'message': 'Server error.'}));
+  }
+}
+
 Future<Response> _checkMemberHandler(Request request) async {
   try {
     final userId = request.context['userId'] as String?;
