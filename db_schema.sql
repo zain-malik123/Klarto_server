@@ -142,6 +142,20 @@ CREATE TABLE public.invitations (
 
 ALTER TABLE public.invitations OWNER TO klarto_api_user;
 
+-- Projects
+CREATE TABLE public.projects (
+    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    owner_id uuid NOT NULL,
+    name character varying(255) NOT NULL,
+    color character varying(50),
+    access_type character varying(20) DEFAULT 'everyone' NOT NULL, -- everyone, team
+    team_id uuid, -- NULL if everyone
+    is_favorite boolean DEFAULT false NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL
+);
+
+ALTER TABLE public.projects OWNER TO klarto_api_user;
+
 CREATE INDEX idx_invitations_token ON public.invitations USING btree (invite_token);
 
 

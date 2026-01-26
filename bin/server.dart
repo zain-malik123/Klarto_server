@@ -11,6 +11,7 @@ import 'package:bcrypt/bcrypt.dart';
 import 'package:crypto/crypto.dart';
 import 'package:http/http.dart' as http;
 import 'package:klarto_server/config.dart';
+import 'package:klarto_server/email_service.dart';
 import 'package:dart_jsonwebtoken/dart_jsonwebtoken.dart';
 import 'package:shelf_static/shelf_static.dart';
 import 'package:path/path.dart' as p;
@@ -18,7 +19,7 @@ import 'package:path/path.dart' as p;
 
 const _corsHeaders = {
   'Access-Control-Allow-Origin': '*', // Allows any origin
-  'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
+  'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, PATCH, OPTIONS',
   'Access-Control-Allow-Headers': 'Origin, Content-Type, Authorization',
 };
 
@@ -36,6 +37,293 @@ Middleware _corsMiddleware() {
     };
   };
 }
+// Handler to return invited members for teams the user belongs to or invites they sent.
+Future<Response> _getInvitedMembersHandler(Request request) async {
+  try {
+    final userId = request.context['userId'] as String?;
+    if (userId == null) return Response.forbidden('Not authorized.');
+
+    // Return invitations where the requester is the inviter or is a member of the team
+    final rows = await _db.query(r'''
+      SELECT i.id, i.team_id, i.invited_user_id, i.email, i.status, i.invite_token_expires_at, i.created_at, u.name AS invited_name, u.profile_picture_base64
+      FROM invitations i
+      LEFT JOIN users u ON u.id = i.invited_user_id
+      WHERE i.inviter_id = @userId OR i.team_id IN (SELECT team_id FROM team_members WHERE user_id = @userId)
+      ORDER BY i.created_at DESC
+    ''', substitutionValues: {'userId': userId});
+
+    final List<Map<String, dynamic>> results = rows.map((r) {
+      final m = r.toColumnMap();
+      if (m['created_at'] is DateTime) m['created_at'] = (m['created_at'] as DateTime).toIso8601String();
+      if (m['invite_token_expires_at'] is DateTime) m['invite_token_expires_at'] = (m['invite_token_expires_at'] as DateTime).toIso8601String();
+      return m;
+    }).toList();
+
+    return Response.ok(json.encode(results), headers: {'Content-Type': 'application/json'});
+  } catch (e, st) {
+    print('Error in _getInvitedMembersHandler: $e');
+    print(st);
+    return Response.internalServerError(body: json.encode({'message': 'Server error.'}), headers: {'Content-Type': 'application/json'});
+  }
+}
+
+// Handler to return all users (available members) — authenticated.
+Future<Response> _getAllUsersHandler(Request request) async {
+  try {
+    final userId = request.context['userId'] as String?;
+    if (userId == null) return Response.forbidden('Not authorized.');
+
+    final rows = await _db.query(r'''
+      SELECT id, name, email, profile_picture_base64
+      FROM users
+      ORDER BY LOWER(name) ASC
+    ''');
+
+    final users = rows.map((r) {
+      final m = r.toColumnMap();
+      return m;
+    }).toList();
+
+    return Response.ok(json.encode(users), headers: {'Content-Type': 'application/json'});
+  } catch (e, st) {
+    print('Error in _getAllUsersHandler: $e');
+    print(st);
+    return Response.internalServerError(body: json.encode({'message': 'Server error.'}), headers: {'Content-Type': 'application/json'});
+  }
+}
+
+// Handler to return current team members for the user's team.
+Future<Response> _getTeamMembersHandler(Request request) async {
+  try {
+    final userId = request.context['userId'] as String?;
+    if (userId == null) return Response.forbidden('Not authorized.');
+
+    String? teamId;
+    final ownerRes = await _db.query('SELECT id FROM teams WHERE owner_id = @owner', substitutionValues: {'owner': userId});
+    if (ownerRes.isNotEmpty) {
+      teamId = ownerRes.first[0] as String;
+    } else {
+      final memberRes = await _db.query('SELECT team_id FROM team_members WHERE user_id = @user LIMIT 1', substitutionValues: {'user': userId});
+      if (memberRes.isNotEmpty) teamId = memberRes.first[0] as String;
+    }
+
+    if (teamId == null) return Response.ok(json.encode([]), headers: {'Content-Type': 'application/json'});
+
+    final rows = await _db.query(r'''
+      SELECT tm.id AS membership_id, u.id AS user_id, u.name, u.email, tm.role, u.profile_picture_base64, tm.joined_at
+      FROM team_members tm
+      JOIN users u ON u.id = tm.user_id
+      WHERE tm.team_id = @team
+      ORDER BY tm.joined_at ASC
+    ''', substitutionValues: {'team': teamId});
+
+    final members = rows.map((r) {
+      final m = r.toColumnMap();
+      if (m['joined_at'] is DateTime) m['joined_at'] = (m['joined_at'] as DateTime).toIso8601String();
+      return m;
+    }).toList();
+
+    return Response.ok(json.encode(members), headers: {'Content-Type': 'application/json'});
+  } catch (e, st) {
+    print('Error in _getTeamMembersHandler: $e');
+    print(st);
+    return Response.internalServerError(body: json.encode({'message': 'Server error.'}), headers: {'Content-Type': 'application/json'});
+  }
+}
+
+// Handler to add an existing user to the requester's team by email.
+Future<Response> _addMemberHandler(Request request) async {
+  try {
+    final inviterId = request.context['userId'] as String?;
+    if (inviterId == null) return Response.forbidden('Not authorized.');
+
+    final bodyString = await request.readAsString();
+    final body = json.decode(bodyString) as Map<String, dynamic>;
+    final email = (body['email'] as String?)?.trim().toLowerCase();
+    if (email == null || email.isEmpty) return Response(400, body: json.encode({'message': 'Email is required.'}), headers: {'Content-Type': 'application/json'});
+
+    // If request includes a `team_name`, create a new team owned by inviter and use it.
+    String? teamId;
+    final requestedTeamName = (body['team_name'] as String?)?.trim();
+    if (requestedTeamName != null && requestedTeamName.isNotEmpty) {
+      final created = await _db.query('INSERT INTO teams (owner_id, name) VALUES (@owner, @name) RETURNING id', substitutionValues: {'owner': inviterId, 'name': requestedTeamName});
+      teamId = created.first[0] as String;
+      print('Team created: id=$teamId name="$requestedTeamName" owner=$inviterId');
+    } else {
+      // Resolve existing team id for inviter (owner preferred)
+      final ownerRes = await _db.query('SELECT id FROM teams WHERE owner_id = @owner', substitutionValues: {'owner': inviterId});
+      if (ownerRes.isNotEmpty) {
+        teamId = ownerRes.first[0] as String;
+      } else {
+        final memberRes = await _db.query('SELECT team_id FROM team_members WHERE user_id = @user LIMIT 1', substitutionValues: {'user': inviterId});
+        if (memberRes.isNotEmpty) teamId = memberRes.first[0] as String;
+      }
+    }
+
+    if (teamId == null) return Response(400, body: json.encode({'message': 'No team found for current user.'}), headers: {'Content-Type': 'application/json'});
+
+    final u = await _db.query('SELECT id FROM users WHERE LOWER(email) = LOWER(@email)', substitutionValues: {'email': email});
+    if (u.isEmpty) return Response(404, body: json.encode({'message': 'User not found.'}), headers: {'Content-Type': 'application/json'});
+    final userId = u.first[0] as String;
+
+    // Check existing membership: if already a member, return the existing member record (idempotent)
+    final exists = await _db.query('SELECT id FROM team_members WHERE team_id = @team AND user_id = @user', substitutionValues: {'team': teamId, 'user': userId});
+    if (exists.isNotEmpty) {
+      final row = await _db.query(r'''
+        SELECT tm.id AS membership_id, u.id AS user_id, u.name, u.email, tm.role, u.profile_picture_base64, tm.joined_at
+        FROM team_members tm JOIN users u ON u.id = tm.user_id
+        WHERE tm.team_id = @team AND tm.user_id = @user
+        LIMIT 1
+      ''', substitutionValues: {'team': teamId, 'user': userId});
+      final m = row.first.toColumnMap();
+      if (m['joined_at'] is DateTime) m['joined_at'] = (m['joined_at'] as DateTime).toIso8601String();
+      return Response.ok(json.encode({'member': m, 'alreadyMember': true}), headers: {'Content-Type': 'application/json'});
+    }
+
+    await _db.query('INSERT INTO team_members (team_id, user_id, role) VALUES (@team, @user, @role)', substitutionValues: {'team': teamId, 'user': userId, 'role': 'member'});
+    print('Added member to team: team=$teamId user=$userId');
+
+    // Return the new member record
+    final row = await _db.query(r'''
+      SELECT tm.id AS membership_id, u.id AS user_id, u.name, u.email, tm.role, u.profile_picture_base64, tm.joined_at
+      FROM team_members tm JOIN users u ON u.id = tm.user_id
+      WHERE tm.team_id = @team AND tm.user_id = @user
+      LIMIT 1
+    ''', substitutionValues: {'team': teamId, 'user': userId});
+
+    final m = row.first.toColumnMap();
+    if (m['joined_at'] is DateTime) m['joined_at'] = (m['joined_at'] as DateTime).toIso8601String();
+
+    return Response.ok(json.encode({'member': m}), headers: {'Content-Type': 'application/json'});
+  } catch (e, st) {
+    print('Error in _addMemberHandler: $e');
+    print(st);
+    return Response.internalServerError(body: json.encode({'message': 'Server error.'}), headers: {'Content-Type': 'application/json'});
+  }
+}
+
+
+// Handler to return teams the user owns or is a member of.
+Future<Response> _getTeamsHandler(Request request) async {
+  try {
+    final userId = request.context['userId'] as String?;
+    if (userId == null) return Response.forbidden('Not authorized.');
+
+    final rows = await _db.query(r'''
+      SELECT t.id, t.name, t.owner_id, u.name AS owner_name
+      FROM teams t
+      JOIN users u ON u.id = t.owner_id
+      WHERE t.owner_id = @userId OR t.id IN (SELECT team_id FROM team_members WHERE user_id = @userId)
+      ORDER BY LOWER(t.name) ASC
+    ''', substitutionValues: {'userId': userId});
+
+    final teams = rows.map((r) => r.toColumnMap()).toList();
+    return Response.ok(json.encode(teams), headers: {'Content-Type': 'application/json'});
+  } catch (e, st) {
+    print('Error in _getTeamsHandler: $e');
+    print(st);
+    return Response.internalServerError(body: json.encode({'message': 'Server error.'}), headers: {'Content-Type': 'application/json'});
+  }
+}
+
+// Handler to return projects the user owns or has access to.
+Future<Response> _getProjectsHandler(Request request) async {
+  try {
+    final userId = request.context['userId'] as String?;
+    if (userId == null) return Response.forbidden('Not authorized.');
+
+    // Projects where owner = userId OR access_type = 'everyone' OR user is in projects.team_id
+    final rows = await _db.query(r'''
+      SELECT p.*
+      FROM projects p
+      WHERE p.owner_id = @userId 
+         OR p.access_type = 'everyone'
+         OR (p.access_type = 'team' AND p.team_id IN (SELECT team_id FROM team_members WHERE user_id = @userId))
+      ORDER BY p.created_at DESC
+    ''', substitutionValues: {'userId': userId});
+
+    final projects = rows.map((r) {
+      final m = r.toColumnMap();
+      if (m['created_at'] is DateTime) m['created_at'] = (m['created_at'] as DateTime).toIso8601String();
+      return m;
+    }).toList();
+
+    return Response.ok(json.encode(projects), headers: {'Content-Type': 'application/json'});
+  } catch (e, st) {
+    print('Error in _getProjectsHandler: $e');
+    print(st);
+    return Response.internalServerError(body: json.encode({'message': 'Server error.'}), headers: {'Content-Type': 'application/json'});
+  }
+}
+
+// Handler to create a new project.
+Future<Response> _createProjectHandler(Request request) async {
+  try {
+    final userId = request.context['userId'] as String?;
+    if (userId == null) return Response.forbidden('Not authorized.');
+
+    final bodyString = await request.readAsString();
+    final body = json.decode(bodyString) as Map<String, dynamic>;
+
+    final name = body['name'] as String?;
+    final color = body['color'] as String?;
+    final access = body['access'] as String?;
+    final isFavorite = (body['is_favorite'] ?? false) as bool;
+
+    if (name == null || name.isEmpty) {
+      return Response(400, body: json.encode({'message': 'Project name is required.'}), headers: {'Content-Type': 'application/json'});
+    }
+
+    String accessType = 'everyone';
+    String? teamId;
+
+    if (access != null && access != 'Everyone') {
+      final teamRes = await _db.query(r'''
+        SELECT id FROM teams 
+        WHERE LOWER(name) = LOWER(@name) 
+        AND (owner_id = @userId OR id IN (SELECT team_id FROM team_members WHERE user_id = @userId))
+        LIMIT 1
+      ''', substitutionValues: {'name': access, 'userId': userId});
+      
+      if (teamRes.isNotEmpty) {
+        teamId = teamRes.first[0] as String;
+        accessType = 'team';
+      }
+    }
+
+    final insertRes = await _db.query(r'''
+      INSERT INTO projects (owner_id, name, color, access_type, team_id, is_favorite)
+      VALUES (@userId, @name, @color, @accessType, @teamId, @isFavorite)
+      RETURNING id
+    ''', substitutionValues: {
+      'userId': userId,
+      'name': name,
+      'color': color,
+      'accessType': accessType,
+      'teamId': teamId,
+      'isFavorite': isFavorite,
+    });
+
+    final projectId = insertRes.first[0] as String;
+
+    return Response.ok(json.encode({
+      'success': true,
+      'project': {
+        'id': projectId,
+        'name': name,
+        'color': color,
+        'access_type': accessType,
+        'team_id': teamId,
+        'is_favorite': isFavorite,
+      }
+    }), headers: {'Content-Type': 'application/json'});
+  } catch (e, st) {
+    print('Error in _createProjectHandler: $e');
+    print(st);
+    return Response.internalServerError(body: json.encode({'message': 'Server error.'}), headers: {'Content-Type': 'application/json'});
+  }
+}
+
 
 // Middleware to verify JWT and add user context.
 Middleware _authMiddleware() {
@@ -80,9 +368,15 @@ late final PostgreSQLConnection _db;
 final _publicRouter = Router()
   ..post('/auth/signup', _signupHandler)
   ..get('/auth/verify', _verifyHandler)
+  // Also accept the legacy/vanity path '/verify-email' so email links
+  // that point to the server (or manual visits) will work.
+  ..get('/verify-email', _verifyHandler)
+  ..post('/auth/resend-verification', _resendVerificationHandler)
   ..post('/auth/login', _loginHandler)
   ..post('/auth/request-password-reset', _requestPasswordResetHandler)
-  ..post('/auth/reset-password', _resetPasswordHandler);
+  ..post('/auth/reset-password', _resetPasswordHandler)
+  // Internal test endpoint to send a test email using SMTP/app password.
+  ..post('/internal/send-test-email', _sendTestEmailHandler);
 
 // Public endpoint for invitees to set their password using the invite token.
 final _publicInviteRouter = Router()
@@ -92,12 +386,14 @@ final _publicInviteRouter = Router()
 final _privateRouter = Router()
   ..post('/filters', _createFilterHandler)
   ..get('/filters', _getFiltersHandler)
+  ..patch('/filters/<id>', _updateFilterHandler)
   ..delete('/filters/<id>', _deleteFilterHandler)
   ..post('/labels', _createLabelHandler)
   ..get('/labels', _getLabelsHandler)
   ..delete('/labels/<id>', _deleteLabelHandler)
   ..post('/todos', _createTodoHandler)
   ..get('/todos', _getTodosHandler)
+  ..patch('/todos/<id>', _updateTodoHandler)
   ..get('/activities', _getActivitiesHandler)
   ..put('/profile', _updateProfileHandler)
   ..post('/profile/avatar', _uploadAvatarHandler)
@@ -105,7 +401,14 @@ final _privateRouter = Router()
   ..get('/profile', _getProfileHandler)
   ..post('/team/invite', _inviteHandler)
   ..get('/team/invite/accept', _acceptInviteHandler)
-  ..post('/team/check-member', _checkMemberHandler);
+  ..post('/team/check-member', _checkMemberHandler)
+  ..get('/team/invited', _getInvitedMembersHandler)
+  ..get('/users', _getAllUsersHandler)
+  ..get('/team/members', _getTeamMembersHandler)
+  ..get('/teams', _getTeamsHandler)
+  ..post('/team/add-member', _addMemberHandler)
+  ..get('/projects', _getProjectsHandler)
+  ..post('/projects', _createProjectHandler);
 
 // Handler for the signup request.
 Future<Response> _signupHandler(Request request) async {
@@ -160,11 +463,12 @@ Future<Response> _signupHandler(Request request) async {
     final verificationToken = base64Url.encode(tokenBytes);
     final tokenExpiry = DateTime.now().add(const Duration(hours: 1));
 
-    // 5. Insert the new user into the database with the token.
-    await _db.query(
+    // 5. Insert the new user into the database with the token and get the new user id.
+    final insertResult = await _db.query(
       r'''
       INSERT INTO users (name, email, password_hash, verification_token, verification_token_expires_at) 
       VALUES (@name, @email, @passwordHash, @token, @tokenExpiry)
+      RETURNING id
       ''',
       substitutionValues: {
         'name': name,
@@ -174,9 +478,45 @@ Future<Response> _signupHandler(Request request) async {
         'tokenExpiry': tokenExpiry.toIso8601String(),
       },
     );
+    final newUserId = insertResult.first[0] as String;
+
+    // 5b. Insert default filters and default tags (labels) for the new user.
+    await _db.transaction((tx) async {
+      // Filters (time/status based views)
+      await tx.query(r"""
+        INSERT INTO filters (user_id, name, query, color, is_favorite, description)
+        VALUES
+          (@userId, 'Today', 'due_today', '#3D4CD6', true, 'Tasks due today'),
+          (@userId, 'Overdue', 'overdue', '#EF4444', false, 'Past due tasks'),
+          (@userId, 'This Week', 'this_week', '#F59E0B', false, 'Due in the next 7 days'),
+          (@userId, 'High Priority', 'high_priority', '#D32F2F', false, 'Urgent & important tasks'),
+          (@userId, 'Low Priority', 'low_priority', '#9E9E9E', false, 'Nice-to-have tasks'),
+          (@userId, 'Completed', 'completed', '#2E7D32', true, 'Finished tasks'),
+          (@userId, 'Assigned to Me', 'assigned_to_me', '#FF7043', false, 'Tasks assigned to you')
+      """,
+      substitutionValues: {'userId': newUserId});
+
+      // Tags (labels) — create 10 handy tags for quick categorization
+      await tx.query(r"""
+        INSERT INTO labels (user_id, name, color, is_favorite)
+        VALUES
+          (@userId, 'Work', '#3D4CD6', false),
+          (@userId, 'Personal', '#8E24AA', false),
+          (@userId, 'Urgent', '#EF4444', false),
+          (@userId, 'Meeting', '#0288D1', false),
+          (@userId, 'Follow-up', '#F59E0B', false),
+          (@userId, 'Finance', '#2E7D32', false),
+          (@userId, 'Health', '#E91E63', false),
+          (@userId, 'Learning', '#7C4DFF', false),
+          (@userId, 'Shopping', '#FF7043', false),
+          (@userId, 'Ideas', '#607D8B', false)
+            ,(@userId, 'Default', '#9E9E9E', false)
+      """,
+      substitutionValues: {'userId': newUserId});
+    });
 
     // 6. Send the verification email via Maileroo HTTP API.
-    final verificationUrl = '${Config.clientBaseUrl}/verify-email?token=$verificationToken';
+    final verificationUrl = '${Config.clientBaseUrl}/verify-email?token=${Uri.encodeQueryComponent(verificationToken)}';
     final emailHtmlBody = '''
         <h1>Welcome to Klarto, $name!</h1>
         <p>Thank you for signing up. Please click the link below to verify your email address:</p>
@@ -184,25 +524,15 @@ Future<Response> _signupHandler(Request request) async {
         <p>This link will expire in 1 hour.</p>
       ''';
 
-    final mailerooUrl = Uri.parse('https://smtp.maileroo.com/api/v2/emails');
-    final mailerooHeaders = {
-      'Content-Type': 'application/json',
-      'Authorization': 'Bearer ${Config.mailerooApiKey}',
-    };
-    final mailerooBody = json.encode({
-      'from': {'address': Config.mailerooSenderAddress, 'display_name': 'Klarto Team'},
-      'to': [{'address': email, 'display_name': name}],
-      'subject': 'Welcome to Klarto! Please Verify Your Email',
-      'html': emailHtmlBody,
-    });
-    
     try {
-      final response = await http.post(mailerooUrl, headers: mailerooHeaders, body: mailerooBody);
-      if (response.statusCode < 200 || response.statusCode >= 300) {
-        print('Maileroo API Error: ${response.statusCode} - ${response.body}');
-      }
+      await EmailService.sendHtmlEmail(
+        to: email!,
+        subject: 'Welcome to Klarto! Please Verify Your Email',
+        html: emailHtmlBody,
+        fromName: 'Klarto Team',
+      );
     } catch (e) {
-      print('Error sending email: $e');
+      print('Error sending verification email: $e');
     }
 
     // 7. Return a success response.
@@ -231,6 +561,85 @@ Future<Response> _signupHandler(Request request) async {
     print('An unexpected error occurred: $e');
     print(stackTrace);
     return Response.internalServerError(body: 'An unexpected server error occurred.');
+  }
+}
+
+// Handler to resend a verification email for an existing user email.
+Future<Response> _resendVerificationHandler(Request request) async {
+  try {
+    final bodyString = await request.readAsString();
+    final body = json.decode(bodyString) as Map<String, dynamic>;
+    final email = body['email'] as String?;
+    if (email == null || email.trim().isEmpty) {
+      return Response(400, body: json.encode({'message': 'Email is required.'}), headers: {'Content-Type': 'application/json'});
+    }
+    final rows = await _db.query('SELECT id, is_verified FROM users WHERE LOWER(email) = LOWER(@email)', substitutionValues: {'email': email.trim()});
+    if (rows.isEmpty) {
+      return Response(404, body: json.encode({'message': 'No user found for that email.'}), headers: {'Content-Type': 'application/json'});
+    }
+    final user = rows.first.toColumnMap();
+    final userId = user['id'] as String;
+    final isVerified = (user['is_verified'] ?? false) as bool;
+    if (isVerified) {
+      return Response(400, body: json.encode({'message': 'This account is already verified.'}), headers: {'Content-Type': 'application/json'});
+    }
+
+    // Generate a new verification token
+    final tokenBytes = List<int>.generate(32, (_) => Random.secure().nextInt(256));
+    final verificationToken = base64Url.encode(tokenBytes);
+    final tokenExpiry = DateTime.now().add(const Duration(hours: 1));
+
+    await _db.query(
+      'UPDATE users SET verification_token = @token, verification_token_expires_at = @expiry WHERE id = @id',
+      substitutionValues: {'token': verificationToken, 'expiry': tokenExpiry.toIso8601String(), 'id': userId},
+    );
+
+    final verificationUrl = '${Config.clientBaseUrl}/verify-email?token=${Uri.encodeQueryComponent(verificationToken)}';
+    final emailHtmlBody = '''
+        <h1>Verify your email</h1>
+        <p>Please click the link below to verify your email address:</p>
+        <p><a href="$verificationUrl">Verify My Email</a></p>
+        <p>This link will expire in 1 hour.</p>
+      ''';
+    try {
+      await EmailService.sendHtmlEmail(
+        to: email.trim(),
+        subject: 'Verify your Klarto email',
+        html: emailHtmlBody,
+        fromName: 'Klarto Team',
+      );
+    } catch (e) {
+      print('Error sending verification email (resend): $e');
+    }
+
+    return Response.ok(json.encode({'message': 'Verification email sent.'}), headers: {'Content-Type': 'application/json'});
+  } catch (e, st) {
+    print('Error in resend verification handler: $e');
+    print(st);
+    return Response.internalServerError(body: 'An unexpected error occurred.');
+  }
+}
+
+// Internal handler to test SMTP email sending. Expects JSON { to, subject, body }
+Future<Response> _sendTestEmailHandler(Request request) async {
+  try {
+    final bodyString = await request.readAsString();
+    final body = json.decode(bodyString) as Map<String, dynamic>;
+    final to = body['to'] as String?;
+    final subject = body['subject'] as String?;
+    final content = body['body'] as String?;
+
+    if (to == null || subject == null || content == null) {
+      return Response(400, body: json.encode({'message': 'to, subject and body are required in JSON'}), headers: {'Content-Type': 'application/json'});
+    }
+
+    await EmailService.sendSupportEmail(to: to, subject: subject, body: content);
+
+    return Response.ok(json.encode({'message': 'Email sent (or queued).'}), headers: {'Content-Type': 'application/json'});
+  } catch (e, st) {
+    print('Error in _sendTestEmailHandler: $e');
+    print(st);
+    return Response.internalServerError(body: json.encode({'message': 'Failed to send email', 'error': e.toString()}), headers: {'Content-Type': 'application/json'});
   }
 }
 
@@ -360,13 +769,13 @@ Future<Response> _requestPasswordResetHandler(Request request) async {
           <p>This link will expire in 1 hour. If you did not request this, you can safely ignore this email.</p>
         ''';
       
-      // Re-using the same email sending logic.
-      // In a larger app, this would be extracted into a dedicated EmailService.
-      final mailerooUrl = Uri.parse('https://smtp.maileroo.com/api/v2/emails');
-      final mailerooHeaders = {'Content-Type': 'application/json', 'Authorization': 'Bearer ${Config.mailerooApiKey}'};
-      final mailerooBody = json.encode({'from': {'address': Config.mailerooSenderAddress, 'display_name': 'Klarto Support'},'to': [{'address': email, 'display_name': name}],'subject': 'Your Klarto Password Reset Request','html': emailHtmlBody});
-      // Only send the email if a user was found.
-      http.post(mailerooUrl, headers: mailerooHeaders, body: mailerooBody).catchError((e) => print('Failed to send password reset email: $e'));
+      // Send password reset email using EmailService which will use Maileroo or SMTP.
+      EmailService.sendHtmlEmail(
+        to: email!,
+        subject: 'Your Klarto Password Reset Request',
+        html: emailHtmlBody,
+        fromName: 'Klarto Support',
+      ).catchError((e) => print('Failed to send password reset email: $e'));
     }
 
     // Always return success.
@@ -529,12 +938,62 @@ Future<Response> _createFilterHandler(Request request) async {
   }
 }
 
+// Handler to update a filter (e.g., toggle is_favorite)
+Future<Response> _updateFilterHandler(Request request, String id) async {
+  try {
+    final userId = request.context['userId'] as String?;
+    if (userId == null) return Response.forbidden('Not authorized.');
+
+    final bodyString = await request.readAsString();
+    if (bodyString.isEmpty) return Response(400, body: json.encode({'message': 'Request body required.'}), headers: {'Content-Type': 'application/json'});
+    final body = json.decode(bodyString) as Map<String, dynamic>;
+
+    final isFavorite = body['is_favorite'] as bool?;
+    if (isFavorite == null) return Response(400, body: json.encode({'message': 'is_favorite (boolean) is required.'}), headers: {'Content-Type': 'application/json'});
+
+    // Ensure ownership
+    final existing = await _db.query('SELECT user_id FROM filters WHERE id = @id LIMIT 1', substitutionValues: {'id': id});
+    if (existing.isEmpty) return Response(404, body: json.encode({'message': 'Filter not found.'}), headers: {'Content-Type': 'application/json'});
+    final ownerId = existing.first[0] as String;
+    if (ownerId != userId) return Response.forbidden('Not authorized to modify this filter.');
+
+    final result = await _db.query(r'''
+      UPDATE filters SET is_favorite = @isFavorite, created_at = created_at WHERE id = @id AND user_id = @userId RETURNING id, name, query, color, is_favorite, created_at, description
+    ''', substitutionValues: {'isFavorite': isFavorite, 'id': id, 'userId': userId});
+
+    if (result.isEmpty) return Response.internalServerError(body: json.encode({'message': 'Failed to update filter.'}), headers: {'Content-Type': 'application/json'});
+
+    final map = result.first.toColumnMap();
+    if (map['created_at'] is DateTime) map['created_at'] = (map['created_at'] as DateTime).toIso8601String();
+
+    return Response.ok(json.encode(map), headers: {'Content-Type': 'application/json'});
+  } catch (e, st) {
+    print('Error updating filter: $e');
+    print(st);
+    return Response.internalServerError(body: json.encode({'message': 'Server error.'}), headers: {'Content-Type': 'application/json'});
+  }
+}
+
 // Handler for deleting a filter.
 Future<Response> _deleteFilterHandler(Request request, String id) async {
   try {
     final userId = request.context['userId'] as String?;
     if (userId == null) {
       return Response.forbidden('Not authorized.');
+    }
+    // Prevent deleting the default/system filter.
+    final check = await _db.query(
+      'SELECT name, query FROM filters WHERE id = @id AND user_id = @userId',
+      substitutionValues: {'id': id, 'userId': userId},
+    );
+    if (check.isEmpty) {
+      return Response.notFound(json.encode({'message': 'Filter not found or you do not have permission to delete it.'}), headers: {'Content-Type': 'application/json'});
+    }
+    final row = check.first.toColumnMap();
+    final fname = (row['name'] ?? '') as String;
+    final fquery = (row['query'] ?? '') as String;
+    if (fquery.toLowerCase() == 'default' || fname.toLowerCase() == 'default') {
+      return Response.forbidden(json.encode({'message': 'The default filter cannot be deleted.'}), headers: {'Content-Type': 'application/json'});
     }
 
     final result = await _db.query(
@@ -543,7 +1002,7 @@ Future<Response> _deleteFilterHandler(Request request, String id) async {
     );
 
     if (result.affectedRowCount == 0) {
-      return Response.notFound(json.encode({'message': 'Filter not found or you do not have permission to delete it.'}));
+      return Response.notFound(json.encode({'message': 'Filter not found or you do not have permission to delete it.'}), headers: {'Content-Type': 'application/json'});
     }
 
     // Log the activity
@@ -568,6 +1027,18 @@ Future<Response> _deleteLabelHandler(Request request, String id) async {
     if (userId == null) {
       return Response.forbidden('Not authorized.');
     }
+    // Prevent deleting the default/system label.
+    final check = await _db.query(
+      'SELECT name FROM labels WHERE id = @id AND user_id = @userId',
+      substitutionValues: {'id': id, 'userId': userId},
+    );
+    if (check.isEmpty) {
+      return Response.notFound(json.encode({'message': 'Label not found or you do not have permission to delete it.'}), headers: {'Content-Type': 'application/json'});
+    }
+    final lname = (check.first.toColumnMap()['name'] ?? '') as String;
+    if (lname.toLowerCase() == 'default') {
+      return Response.forbidden(json.encode({'message': 'The default label cannot be deleted.'}), headers: {'Content-Type': 'application/json'});
+    }
 
     final result = await _db.query(
       'DELETE FROM labels WHERE id = @id AND user_id = @userId',
@@ -575,7 +1046,7 @@ Future<Response> _deleteLabelHandler(Request request, String id) async {
     );
 
     if (result.affectedRowCount == 0) {
-      return Response.notFound(json.encode({'message': 'Label not found or you do not have permission to delete it.'}));
+      return Response.notFound(json.encode({'message': 'Label not found or you do not have permission to delete it.'}), headers: {'Content-Type': 'application/json'});
     }
 
     // Log the activity
@@ -690,20 +1161,21 @@ Future<Response> _createTodoHandler(Request request) async {
     final title = body['title'] as String?;
     final description = body['description'] as String?;
     final projectName = body['project_name'] as String?;
+    final projectId = body['project_id'] as String?;
     final dueDate = body['due_date'] as String?;
     final dueTime = body['due_time'] as String?;
     final repeatValue = body['repeat_value'] as String?;
     final priority = body['priority'] as int?;
     final labelId = body['label_id'] as String?;
 
-    if (title == null || description == null || projectName == null || dueDate == null || dueTime == null || repeatValue == null || priority == null || labelId == null) {
+    if (title == null || description == null || projectName == null || projectId == null || dueDate == null || dueTime == null || repeatValue == null || priority == null || labelId == null) {
       return Response(400, body: json.encode({'message': 'All fields are required.'}));
     }
 
     final result = await _db.query(
       r'''
-      INSERT INTO todos (user_id, title, description, project_name, due_date, due_time, repeat_value, priority, label_id)
-      VALUES (@userId, @title, @description, @projectName, @dueDate, @dueTime, @repeatValue, @priority, @labelId)
+      INSERT INTO todos (user_id, title, description, project_name, project_id, due_date, due_time, repeat_value, priority, label_id)
+      VALUES (@userId, @title, @description, @projectName, @projectId, @dueDate, @dueTime, @repeatValue, @priority, @labelId)
       RETURNING *
       ''',
       substitutionValues: {
@@ -711,6 +1183,7 @@ Future<Response> _createTodoHandler(Request request) async {
         'title': title,
         'description': description,
         'projectName': projectName,
+        'projectId': projectId,
         'dueDate': dueDate,
         'dueTime': dueTime,
         'repeatValue': repeatValue,
@@ -750,20 +1223,52 @@ Future<Response> _getTodosHandler(Request request) async {
     if (userId == null) {
       return Response.forbidden('Not authorized.');
     }
+    // Support optional filtering via ?filter=<query>. Supported filters:
+    // due_today, overdue, this_week, high_priority, low_priority, completed
+    final filter = request.url.queryParameters['filter']?.trim().toLowerCase();
+    final clientDateStr = request.url.queryParameters['date']?.trim();
 
-    // Join with labels to get label name and color directly.
-    final result = await _db.query(
-      r'''
+    // If the client provided a date (YYYY-MM-DD), use that for comparisons
+    // to avoid server timezone issues. Otherwise fall back to CURRENT_DATE.
+    final bool hasClientDate = clientDateStr != null && clientDateStr.isNotEmpty;
+    String baseQuery = r'''
       SELECT 
-        t.id, t.title, t.description, t.project_name, t.due_date, t.due_time, t.repeat_value, t.priority, t.is_completed, t.created_at,
+        t.id, t.title, t.description, t.project_name, t.project_id, t.due_date, t.due_time, t.repeat_value, t.priority, t.is_completed, t.created_at,
         l.name as label_name, l.color as label_color
       FROM todos t
       LEFT JOIN labels l ON t.label_id = l.id
-      WHERE t.user_id = @userId 
-      ORDER BY t.created_at DESC
-      ''',
-      substitutionValues: {'userId': userId},
-    );
+      WHERE t.user_id = @userId
+    ''';
+
+    // Append filter-specific conditions
+    final dateExpr = hasClientDate ? "DATE(@clientDate)" : "CURRENT_DATE";
+
+    if (filter == 'due_today' || filter == 'today') {
+      baseQuery += " AND (DATE(t.due_date) = $dateExpr)";
+    } else if (filter == 'overdue') {
+      baseQuery += " AND t.is_completed = false AND (t.due_date IS NOT NULL AND DATE(t.due_date) < $dateExpr)";
+    } else if (filter == 'this_week') {
+      // Calculate week boundaries explicitly so we return only todos due within
+      // the same calendar week (Mon-Sun by PostgreSQL's date_trunc('week')).
+      if (hasClientDate) {
+        baseQuery += " AND (t.due_date IS NOT NULL AND DATE(t.due_date) >= (DATE(date_trunc('week', DATE(@clientDate)))) AND DATE(t.due_date) < (DATE(date_trunc('week', DATE(@clientDate))) + INTERVAL '7 days'))";
+      } else {
+        baseQuery += " AND (t.due_date IS NOT NULL AND DATE(t.due_date) >= (DATE(date_trunc('week', CURRENT_DATE))) AND DATE(t.due_date) < (DATE(date_trunc('week', CURRENT_DATE)) + INTERVAL '7 days'))";
+      }
+    } else if (filter == 'high_priority') {
+      baseQuery += " AND t.priority = 1";
+    } else if (filter == 'low_priority') {
+      baseQuery += " AND t.priority = 4";
+    } else if (filter == 'completed') {
+      baseQuery += " AND t.is_completed = true";
+    }
+
+    baseQuery += " ORDER BY t.created_at DESC";
+
+    final substitutionValues = {'userId': userId};
+    if (hasClientDate) substitutionValues['clientDate'] = clientDateStr;
+
+    final result = await _db.query(baseQuery, substitutionValues: substitutionValues);
 
     final todos = result.map((row) {
       final map = row.toColumnMap();
@@ -787,9 +1292,85 @@ Future<Response> _getTodosHandler(Request request) async {
   }
 }
 
+// Handler to update a todo (partial updates supported).
+Future<Response> _updateTodoHandler(Request request, String id) async {
+  try {
+    final userId = request.context['userId'] as String?;
+    if (userId == null) return Response.forbidden('Not authorized.');
+
+    final bodyString = await request.readAsString();
+    if (bodyString.isEmpty) return Response(400, body: json.encode({'message': 'Request body required.'}), headers: {'Content-Type': 'application/json'});
+    final body = json.decode(bodyString) as Map<String, dynamic>;
+
+    // Ensure the todo belongs to the user
+    final existing = await _db.query('SELECT user_id, is_completed, title, description FROM todos WHERE id = @id LIMIT 1', substitutionValues: {'id': id});
+    if (existing.isEmpty) return Response(404, body: json.encode({'message': 'Todo not found.'}), headers: {'Content-Type': 'application/json'});
+    final ownerId = existing.first[0] as String;
+    final currentlyCompleted = existing.first[1] as bool;
+    if (ownerId != userId) return Response.forbidden('Not authorized to modify this todo.');
+
+    final updates = <String, dynamic>{};
+    final List<String> setClauses = [];
+
+    if (body.containsKey('is_completed')) {
+      final isCompleted = body['is_completed'] as bool?;
+      if (currentlyCompleted == true && isCompleted == false) {
+        return Response(400, body: json.encode({'message': 'Completed todos cannot be reopened.'}), headers: {'Content-Type': 'application/json'});
+      }
+      updates['isCompleted'] = isCompleted;
+      setClauses.add('is_completed = @isCompleted');
+    }
+
+    if (body.containsKey('title')) {
+      updates['title'] = body['title'] as String?;
+      setClauses.add('title = @title');
+    }
+
+    if (body.containsKey('description')) {
+      updates['description'] = body['description'] as String?;
+      setClauses.add('description = @description');
+    }
+
+    if (setClauses.isEmpty) {
+      return Response(400, body: json.encode({'message': 'No valid fields provided for update.'}), headers: {'Content-Type': 'application/json'});
+    }
+
+    updates['id'] = id;
+    updates['userId'] = userId;
+    final query = 'UPDATE todos SET ${setClauses.join(', ')}, updated_at = NOW() WHERE id = @id AND user_id = @userId RETURNING *';
+
+    final result = await _db.query(query, substitutionValues: updates);
+
+    if (result.isEmpty) {
+      return Response.internalServerError(body: json.encode({'message': 'Failed to update todo.'}), headers: {'Content-Type': 'application/json'});
+    }
+
+    final updated = result.first.toColumnMap();
+    if (updated['created_at'] is DateTime) updated['created_at'] = (updated['created_at'] as DateTime).toIso8601String();
+    if (updated['updated_at'] is DateTime) updated['updated_at'] = (updated['updated_at'] as DateTime).toIso8601String();
+    if (updated['due_date'] is DateTime) updated['due_date'] = (updated['due_date'] as DateTime).toIso8601String().substring(0, 10);
+
+    // Log activity
+    _logActivity(userId: userId, activityName: 'Update Todo', description: 'User updated todo $id');
+
+    return Response.ok(json.encode(updated), headers: {'Content-Type': 'application/json'});
+  } catch (e, st) {
+    print('Error updating todo: $e');
+    print(st);
+    return Response.internalServerError(body: json.encode({'message': 'Server error.'}), headers: {'Content-Type': 'application/json'});
+  }
+}
+
 // Handler for the email verification request.
 Future<Response> _verifyHandler(Request request) async {  
   final token = request.url.queryParameters['token'];
+
+  // If no token but the client provided an `auth` JWT (or other query
+  // params) — forward the full query to the client app's verify page.
+  if ((token == null || token.isEmpty) && request.url.query.isNotEmpty) {
+    final redirect = '${Config.clientBaseUrl}/verify-email?${request.url.query}';
+    return Response.seeOther(Uri.parse(redirect));
+  }
 
   if (token == null || token.isEmpty) {
     return _generateHtmlResponse(
@@ -859,7 +1440,7 @@ Future<Response> _verifyHandler(Request request) async {
 
       // Generate JWT so the user can be logged in immediately
       final jwtToken = JWT({'id': userId}).sign(SecretKey(Config.jwtSecret), expiresIn: const Duration(days: 7));
-      final redirectUrl = '${Config.clientBaseUrl}/verify-email?auth=$jwtToken&inviteAccepted=1';
+      final redirectUrl = '${Config.clientBaseUrl}/verify-email?auth=${Uri.encodeQueryComponent(jwtToken)}&inviteAccepted=1';
       return Response.seeOther(Uri.parse(redirectUrl));
     }
 
@@ -904,7 +1485,7 @@ Future<Response> _verifyHandler(Request request) async {
 
     // Generate JWT and redirect so the user can login immediately
     final jwtToken = JWT({'id': userId}).sign(SecretKey(Config.jwtSecret), expiresIn: const Duration(days: 7));
-    final redirectUrl = '${Config.clientBaseUrl}/verify-email?auth=$jwtToken';
+    final redirectUrl = '${Config.clientBaseUrl}/verify-email?auth=${Uri.encodeQueryComponent(jwtToken)}';
     return Response.seeOther(Uri.parse(redirectUrl));
   } catch (e, stackTrace) {
     print('Error during verification: $e');
@@ -1096,6 +1677,8 @@ Future<void> _logActivity({
 }
 
 void main(List<String> args) async {
+  // Load environment variables from .env (required for Config getters below)
+  Config.load();
   // --- Database Connection ---
   _db = PostgreSQLConnection(
     Config.dbHost,
@@ -1106,6 +1689,14 @@ void main(List<String> args) async {
   );
 
   await _db.open();
+  // Ensure required tables exist (helpful for local/dev runs where migrations
+  // may not have been applied). This creates the `projects` table if missing.
+  try {
+    await _ensureProjectsTable();
+  } catch (e, st) {
+    print('Error ensuring projects table exists: $e');
+    print(st);
+  }
   print('Successfully connected to the database.');
 
   // --- Server Setup ---
@@ -1214,8 +1805,7 @@ Future<Response> _inviteHandler(Request request) async {
       teamId = teamResult.first[0] as String;
     }
 
-    final mailerooUrl = Uri.parse('https://smtp.maileroo.com/api/v2/emails');
-    final mailerooHeaders = {'Content-Type': 'application/json', 'Authorization': 'Bearer ${Config.mailerooApiKey}'};
+    // Email sending will use EmailService which prefers Maileroo if configured, otherwise SMTP.
 
     final results = <Map<String, dynamic>>[];
 
@@ -1283,19 +1873,14 @@ Future<Response> _inviteHandler(Request request) async {
             <p><a href="$acceptUrl">Set password & Accept Invitation</a></p>
             <p>This link will expire in 7 days. If you did not expect this invitation, you can safely ignore this email.</p>
         ''';
-        final mailerooBody = json.encode({
-          'from': {'address': Config.mailerooSenderAddress, 'display_name': 'Klarto Team'},
-          'to': [{'address': email, 'display_name': ''}],
-          'subject': 'You were invited to join Klarto',
-          'html': emailHtmlBody,
-        });
         try {
-          final resp = await http.post(mailerooUrl, headers: mailerooHeaders, body: mailerooBody);
-          if (resp.statusCode >= 200 && resp.statusCode < 300) {
-            results.add({'email': email, 'success': true, 'message': 'Invitation sent (account created).' });
-          } else {
-            results.add({'email': email, 'success': false, 'message': 'Failed to send email.'});
-          }
+          await EmailService.sendHtmlEmail(
+            to: email!,
+            subject: 'You were invited to join Klarto',
+            html: emailHtmlBody,
+            fromName: 'Klarto Team',
+          );
+          results.add({'email': email, 'success': true, 'message': 'Invitation sent (account created).'});
         } catch (e) {
           results.add({'email': email, 'success': false, 'message': 'Email send error.'});
         }
@@ -1330,19 +1915,14 @@ Future<Response> _inviteHandler(Request request) async {
           <p><a href="$acceptUrl">Verify & Accept Invitation</a></p>
           <p>This link will expire in 7 days. If you did not request this, you may ignore this message.</p>
         ''';
-        final mailerooBody = json.encode({
-          'from': {'address': Config.mailerooSenderAddress, 'display_name': 'Klarto Team'},
-          'to': [{'address': email, 'display_name': ''}],
-          'subject': 'Invitation to join Klarto',
-          'html': emailHtmlBody,
-        });
         try {
-          final resp = await http.post(mailerooUrl, headers: mailerooHeaders, body: mailerooBody);
-          if (resp.statusCode >= 200 && resp.statusCode < 300) {
-            results.add({'email': email, 'success': true, 'message': 'Invitation sent.' });
-          } else {
-            results.add({'email': email, 'success': false, 'message': 'Failed to send email.'});
-          }
+          await EmailService.sendHtmlEmail(
+            to: email!,
+            subject: 'Invitation to join Klarto',
+            html: emailHtmlBody,
+            fromName: 'Klarto Team',
+          );
+          results.add({'email': email, 'success': true, 'message': 'Invitation sent.'});
         } catch (e) {
           results.add({'email': email, 'success': false, 'message': 'Email send error.'});
         }
@@ -1491,6 +2071,29 @@ Future<Response> _getProfileHandler(Request request) async {
     print('Error retrieving profile: $e');
     print(stackTrace);
     return Response.internalServerError(body: 'An unexpected server error occurred.');
+  }
+}
+
+// Ensure the `projects` table exists. This is a lightweight guard for
+// development environments where the SQL schema may not have been applied.
+Future<void> _ensureProjectsTable() async {
+  try {
+    await _db.query(r"""
+      CREATE TABLE IF NOT EXISTS public.projects (
+          id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+          owner_id uuid NOT NULL,
+          name character varying(255) NOT NULL,
+          color character varying(50),
+          access_type character varying(20) DEFAULT 'everyone' NOT NULL,
+          team_id uuid,
+          is_favorite boolean DEFAULT false NOT NULL,
+          created_at timestamp with time zone DEFAULT now() NOT NULL
+      );
+    """);
+  } catch (e, st) {
+    print('Failed to create projects table: $e');
+    print(st);
+    rethrow;
   }
 }
 Future<Response> _checkMemberHandler(Request request) async {

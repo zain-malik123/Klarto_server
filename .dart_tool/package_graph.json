@@ -12,6 +12,7 @@
         "dart_jsonwebtoken",
         "dotenv",
         "http",
+        "mailer",
         "path",
         "postgres",
         "shelf",
@@ -58,6 +59,19 @@
       "name": "lints",
       "version": "2.1.1",
       "dependencies": []
+    },
+    {
+      "name": "mailer",
+      "version": "6.6.0",
+      "dependencies": [
+        "async",
+        "crypto",
+        "intl",
+        "logging",
+        "meta",
+        "mime",
+        "path"
+      ]
     },
     {
       "name": "path",
@@ -375,8 +389,27 @@
       ]
     },
     {
+      "name": "meta",
+      "version": "1.17.0",
+      "dependencies": []
+    },
+    {
       "name": "mime",
       "version": "1.0.6",
+      "dependencies": []
+    },
+    {
+      "name": "intl",
+      "version": "0.20.2",
+      "dependencies": [
+        "clock",
+        "meta",
+        "path"
+      ]
+    },
+    {
+      "name": "logging",
+      "version": "1.3.0",
       "dependencies": []
     },
     {
@@ -426,11 +459,6 @@
       "dependencies": []
     },
     {
-      "name": "meta",
-      "version": "1.17.0",
-      "dependencies": []
-    },
-    {
       "name": "args",
       "version": "2.7.0",
       "dependencies": []
@@ -466,11 +494,6 @@
       "dependencies": [
         "source_span"
       ]
-    },
-    {
-      "name": "logging",
-      "version": "1.3.0",
-      "dependencies": []
     },
     {
       "name": "web_socket",
