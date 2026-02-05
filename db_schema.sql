@@ -163,7 +163,7 @@ CREATE TABLE public.projects (
     owner_id uuid NOT NULL,
     name character varying(255) NOT NULL,
     color character varying(50),
-    access_type character varying(20) DEFAULT 'everyone'::character varying NOT NULL,
+    access_type character varying(20) DEFAULT 'private'::character varying NOT NULL,
     team_id uuid,
     is_favorite boolean DEFAULT false NOT NULL,
     created_at timestamp with time zone DEFAULT now() NOT NULL

@@ -305,7 +305,7 @@ Future<Response> _getProjectsHandler(Request request) async {
     final userId = request.context['userId'] as String?;
     if (userId == null) return Response.forbidden('Not authorized.');
 
-    // Projects where owner = userId OR access_type = 'everyone' OR user is in projects.team_id
+    // Projects where owner = userId OR user is in projects.team_id
     // joined_count includes all team members plus the team owner, ensuring no double counting.
     final rows = await _db.query(r'''
       SELECT p.*, t.name as team_name,
@@ -324,7 +324,6 @@ Future<Response> _getProjectsHandler(Request request) async {
       FROM projects p
       LEFT JOIN teams t ON t.id = p.team_id
       WHERE p.owner_id = @userId::uuid 
-         OR p.access_type = 'everyone'
          OR (p.access_type = 'team' AND p.team_id IN (SELECT team_id FROM team_members WHERE user_id = @userId::uuid))
       ORDER BY p.created_at DESC
     ''', substitutionValues: {'userId': userId});
@@ -370,10 +369,10 @@ Future<Response> _createProjectHandler(Request request) async {
       return Response(400, body: json.encode({'message': 'Project name is required.'}), headers: {'Content-Type': 'application/json'});
     }
 
-    String accessType = 'everyone';
+    String accessType = 'private';
     String? teamId;
 
-    if (access != null && access != 'Everyone') {
+    if (access != null && access != 'Everyone' && access != 'Private') {
       final teamRes = await _db.query(r'''
         SELECT id FROM teams 
         WHERE LOWER(name) = LOWER(@name) 
@@ -1659,7 +1658,6 @@ Future<Response> _getTodosHandler(Request request) async {
         t.project_id IN (
            SELECT p.id FROM projects p 
            WHERE p.owner_id = @userId::uuid 
-              OR p.access_type = 'everyone' 
               OR (p.access_type = 'team' AND p.team_id IN (SELECT team_id FROM team_members WHERE user_id = @userId::uuid))
         )
       )
@@ -2254,7 +2252,7 @@ Future<Response> _deleteTeamHandler(Request request, String name) async {
     await _db.query('DELETE FROM invitations WHERE team_id = @id', substitutionValues: {'id': teamId});
     // Optional: Delete projects associated with this team? 
     // Usually it's better to keep them or reassign. For now, let's just clear team_id from projects.
-    await _db.query('UPDATE projects SET team_id = NULL, access_type = \'everyone\' WHERE team_id = @id', substitutionValues: {'id': teamId});
+    await _db.query('UPDATE projects SET team_id = NULL, access_type = \'private\' WHERE team_id = @id', substitutionValues: {'id': teamId});
     await _db.query('DELETE FROM teams WHERE id = @id', substitutionValues: {'id': teamId});
 
     return Response.ok(json.encode({'success': true, 'message': 'Team deleted successfully.'}), headers: {'Content-Type': 'application/json'});
@@ -2809,7 +2807,7 @@ Future<void> _ensureProjectsTable() async {
           owner_id uuid NOT NULL,
           name character varying(255) NOT NULL,
           color character varying(50),
-          access_type character varying(20) DEFAULT 'everyone' NOT NULL,
+          access_type character varying(20) DEFAULT 'private' NOT NULL,
           team_id uuid,
           is_favorite boolean DEFAULT false NOT NULL,
           created_at timestamp with time zone DEFAULT now() NOT NULL
