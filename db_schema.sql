@@ -283,6 +283,40 @@ CREATE TABLE public.users (
 
 ALTER TABLE public.users OWNER TO klarto_api_user;
 
+CREATE TABLE public.subscription_plans (
+    id uuid DEFAULT public.uuid_generate_v4() PRIMARY KEY,
+    name character varying(100) UNIQUE NOT NULL,
+    member_limit integer NOT NULL,
+    price numeric(10,2) NOT NULL,
+    stripe_price_id character varying(255),
+    created_at timestamp with time zone DEFAULT now() NOT NULL
+);
+
+ALTER TABLE public.subscription_plans OWNER TO klarto_api_user;
+
+CREATE TABLE public.user_subscriptions (
+    id uuid DEFAULT public.uuid_generate_v4() PRIMARY KEY,
+    user_id uuid NOT NULL UNIQUE,
+    plan_id uuid NOT NULL,
+    stripe_customer_id character varying(255),
+    stripe_subscription_id character varying(255),
+    card_last_four character varying(4),
+    card_brand character varying(50),
+    status character varying(20) DEFAULT 'active' NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    FOREIGN KEY (user_id) REFERENCES public.users(id),
+    FOREIGN KEY (plan_id) REFERENCES public.subscription_plans(id)
+);
+
+ALTER TABLE public.user_subscriptions OWNER TO klarto_api_user;
+
+CREATE TABLE public.trial_usage (
+    email character varying(255) PRIMARY KEY,
+    used_at timestamp with time zone DEFAULT now() NOT NULL
+);
+
+ALTER TABLE public.trial_usage OWNER TO klarto_api_user;
+
 --
 -- Name: activities activities_pkey; Type: CONSTRAINT; Schema: public; Owner: klarto_api_user
 --

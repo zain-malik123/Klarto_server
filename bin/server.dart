@@ -202,6 +202,34 @@ Future<Response> _addMemberHandler(Request request) async {
 
     if (teamId == null) return Response(400, body: json.encode({'message': 'No team found for current user.'}), headers: {'Content-Type': 'application/json'});
 
+    // --- Subscription Enforcement ---
+    final subRows = await _db.query(r"""
+      SELECT sp.member_limit 
+      FROM user_subscriptions us 
+      JOIN subscription_plans sp ON us.plan_id = sp.id 
+      WHERE us.user_id = @userId::uuid
+    """, substitutionValues: {'userId': inviterId});
+
+    if (subRows.isEmpty) {
+      return Response(402, body: json.encode({'message': 'A subscription is required to add team members.'}));
+    }
+
+    final memberLimit = subRows.first[0] as int;
+
+    final currentMembersRes = await _db.query('SELECT COUNT(*) FROM team_members WHERE team_id = @team', substitutionValues: {'team': teamId});
+    final currentMembers = currentMembersRes.first[0] as int;
+    
+    final pendingInvitesRes = await _db.query("SELECT COUNT(*) FROM invitations WHERE team_id = @team AND status = 'pending'", substitutionValues: {'team': teamId});
+    final pendingInvites = pendingInvitesRes.first[0] as int;
+
+    // Check if adding this user exceeds the limit (1 owner + existing + pending + this new one)
+    if (1 + currentMembers + pendingInvites + 1 > memberLimit) {
+      return Response(400, body: json.encode({
+        'message': 'You have reached the total member limit for your plan ($memberLimit people). Please upgrade your subscription.'
+      }));
+    }
+    // --- End Subscription Enforcement ---
+
     final u = await _db.query('SELECT id FROM users WHERE LOWER(email) = LOWER(@email)', substitutionValues: {'email': email});
     if (u.isEmpty) return Response(404, body: json.encode({'message': 'User not found.'}), headers: {'Content-Type': 'application/json'});
     final userId = u.first[0] as String;
@@ -280,7 +308,7 @@ Future<Response> _getProjectsHandler(Request request) async {
     // Projects where owner = userId OR access_type = 'everyone' OR user is in projects.team_id
     // joined_count includes all team members plus the team owner, ensuring no double counting.
     final rows = await _db.query(r'''
-      SELECT p.*,
+      SELECT p.*, t.name as team_name,
         (SELECT COUNT(*) FROM team_members tm WHERE tm.team_id = p.team_id) +
         (CASE 
           WHEN p.team_id IS NOT NULL 
@@ -294,6 +322,7 @@ Future<Response> _getProjectsHandler(Request request) async {
         END) AS joined_count,
         (SELECT COUNT(*) FROM invitations i WHERE i.team_id = p.team_id AND i.status = 'pending') as pending_count
       FROM projects p
+      LEFT JOIN teams t ON t.id = p.team_id
       WHERE p.owner_id = @userId::uuid 
          OR p.access_type = 'everyone'
          OR (p.access_type = 'team' AND p.team_id IN (SELECT team_id FROM team_members WHERE user_id = @userId::uuid))
@@ -416,13 +445,19 @@ Middleware _authMiddleware() {
         print('Auth: Token verified for user ID: $userId');
         // Attach the user ID to the request context for later use.
         final updatedRequest = request.change(context: {'userId': userId});
-        return await innerHandler(updatedRequest);
+        final response = await innerHandler(updatedRequest);
+        print('Auth: Inner handler returned status: ${response.statusCode}');
+        return response;
       } on JWTExpiredException {
         print('Auth Error: Token has expired.');
         return Response.unauthorized('Not authorized. Token has expired.');
       } on JWTException catch (err) {
         print('Auth Error: Invalid token - ${err.message}');
         return Response.unauthorized('Not authorized. Invalid token: ${err.message}');
+      } catch (e, st) {
+        print('Auth Error: Unexpected error - $e');
+        print(st);
+        return Response.internalServerError(body: 'Internal Auth Error');
       }
     };
   };
@@ -431,63 +466,71 @@ Middleware _authMiddleware() {
 // A global variable for the database connection.
 late final PostgreSQLConnection _db;
 
-// Router for public endpoints that do not require authentication.
-final _publicRouter = Router()
+// Combined Router for all endpoints.
+final _mainRouter = Router()
+  // --- Public Routes ---
+  ..get('/plans', (Request request) {
+    print('Public Route Accessed: /plans');
+    return _getPlansHandler(request);
+  })
+  ..get('/plans/', (Request request) {
+    print('Public Route Accessed: /plans/');
+    return _getPlansHandler(request);
+  })
   ..post('/auth/signup', _signupHandler)
   ..get('/auth/verify', _verifyHandler)
-  // Also accept the legacy/vanity path '/verify-email' so email links
-  // that point to the server (or manual visits) will work.
   ..get('/verify-email', _verifyHandler)
   ..post('/auth/resend-verification', _resendVerificationHandler)
   ..post('/auth/login', _loginHandler)
+  ..post('/auth/google', _googleLoginHandler)
   ..post('/auth/request-password-reset', _requestPasswordResetHandler)
   ..post('/auth/reset-password', _resetPasswordHandler)
-  // Internal test endpoint to send a test email using SMTP/app password.
   ..post('/internal/send-test-email', _sendTestEmailHandler)
   ..get('/activities', _getActivitiesHandler)
-  ..post('/activities', _saveActivityHandler);
-
-// Public endpoint for invitees to set their password using the invite token.
-final _publicInviteRouter = Router()
-  ..post('/team/invite/set-password', _setPasswordForInviteHandler);
-
-// Router for private endpoints that require a valid JWT.
-final _privateRouter = Router()
-  ..post('/filters', _createFilterHandler)
-  ..get('/filters', _getFiltersHandler)
-  ..patch('/filters/<id>', _updateFilterHandler)
-  ..delete('/filters/<id>', _deleteFilterHandler)
-  ..post('/labels', _createLabelHandler)
-  ..get('/labels', _getLabelsHandler)
-  ..delete('/labels/<id>', _deleteLabelHandler)
-  ..post('/todos', _createTodoHandler)
-  ..get('/todos', _getTodosHandler)
-  ..patch('/todos/<id>', _updateTodoHandler)
-  ..put('/profile', _updateProfileHandler)
-  ..post('/profile/avatar', _uploadAvatarHandler)
-  ..get('/profile/avatar', _getAvatarHandler)
-  ..get('/profile', _getProfileHandler)
-  ..post('/complete-onboarding', _completeOnboardingHandler)
-  ..post('/team/invite', _inviteHandler)
-  ..get('/team/invite/accept', _acceptInviteHandler)
-  ..post('/team/check-member', _checkMemberHandler)
-  ..get('/team/invited', _getInvitedMembersHandler)
-  ..get('/users', _getAllUsersHandler)
-  ..get('/team/members', _getTeamMembersHandler)
-  ..get('/teams', _getTeamsHandler)
-  ..post('/teams', _createTeamHandler)
-  ..delete('/team/<name>', _deleteTeamHandler)
-  ..post('/team/add-member', _addMemberHandler)
-  ..get('/projects', _getProjectsHandler)
-  ..post('/projects', _createProjectHandler)
-  ..delete('/projects/<id>', _deleteProjectHandler)
-  ..get('/notes', _getNotesHandler)
-  ..post('/notes', _addNoteHandler)
-  ..post('/todos/comments', _addCommentHandler)
-  ..get('/todos/<id>/comments', _getCommentsHandler)
-  ..post('/todos/sub-todos', _addSubTodoHandler)
-  ..get('/todos/<id>/sub-todos', _getSubTodosHandler)
-  ..patch('/todos/sub-todos/<id>/toggle', _toggleSubTodoHandler);
+  ..post('/activities', _saveActivityHandler)
+  ..post('/team/invite/set-password', _setPasswordForInviteHandler)
+  
+  // --- Private Routes (Auth Protected) ---
+  ..post('/filters', _authMiddleware()(_createFilterHandler))
+  ..get('/filters', _authMiddleware()(_getFiltersHandler))
+  ..patch('/filters/<id>', (Request req, String id) => _authMiddleware()((Request r) => _updateFilterHandler(r, id))(req))
+  ..delete('/filters/<id>', (Request req, String id) => _authMiddleware()((Request r) => _deleteFilterHandler(r, id))(req))
+  ..post('/labels', _authMiddleware()(_createLabelHandler))
+  ..get('/labels', _authMiddleware()(_getLabelsHandler))
+  ..put('/labels/<id>', (Request req, String id) => _authMiddleware()((Request r) => _updateLabelHandler(r, id))(req))
+  ..delete('/labels/<id>', (Request req, String id) => _authMiddleware()((Request r) => _deleteLabelHandler(r, id))(req))
+  ..post('/todos', _authMiddleware()(_createTodoHandler))
+  ..get('/todos', _authMiddleware()(_getTodosHandler))
+  ..patch('/todos/<id>', (Request req, String id) => _authMiddleware()((Request r) => _updateTodoHandler(r, id))(req))
+  ..put('/profile', _authMiddleware()(_updateProfileHandler))
+  ..post('/profile/avatar', _authMiddleware()(_uploadAvatarHandler))
+  ..get('/profile/avatar', _authMiddleware()(_getAvatarHandler))
+  ..get('/profile', _authMiddleware()(_getProfileHandler))
+  ..get('/profile/', _authMiddleware()(_getProfileHandler))
+  ..post('/complete-onboarding', _authMiddleware()(_completeOnboardingHandler))
+  ..post('/team/invite', _authMiddleware()(_inviteHandler))
+  ..get('/team/invite/accept', _authMiddleware()(_acceptInviteHandler))
+  ..post('/team/check-member', _authMiddleware()(_checkMemberHandler))
+  ..get('/team/invited', _authMiddleware()(_getInvitedMembersHandler))
+  ..get('/users', _authMiddleware()(_getAllUsersHandler))
+  ..get('/team/members', _authMiddleware()(_getTeamMembersHandler))
+  ..get('/teams', _authMiddleware()(_getTeamsHandler))
+  ..post('/teams', _authMiddleware()(_createTeamHandler))
+  ..delete('/team/<name>', (Request req, String name) => _authMiddleware()((Request r) => _deleteTeamHandler(r, name))(req))
+  ..post('/team/add-member', _authMiddleware()(_addMemberHandler))
+  ..get('/projects', _authMiddleware()(_getProjectsHandler))
+  ..post('/projects', _authMiddleware()(_createProjectHandler))
+  ..delete('/projects/<id>', (Request req, String id) => _authMiddleware()((Request r) => _deleteProjectHandler(r, id))(req))
+  ..get('/notes', _authMiddleware()(_getNotesHandler))
+  ..post('/notes', _authMiddleware()(_addNoteHandler))
+  ..post('/todos/comments', _authMiddleware()(_addCommentHandler))
+  ..get('/todos/<id>/comments', (Request req, String id) => _authMiddleware()((Request r) => _getCommentsHandler(r, id))(req))
+  ..post('/todos/sub-todos', _authMiddleware()(_addSubTodoHandler))
+  ..get('/todos/<id>/sub-todos', (Request req, String id) => _authMiddleware()((Request r) => _getSubTodosHandler(r, id))(req))
+  ..patch('/todos/sub-todos/<id>/toggle', (Request req, String id) => _authMiddleware()((Request r) => _toggleSubTodoHandler(r, id))(req))
+  ..patch('/todos/sub-todos/<id>', (Request req, String id) => _authMiddleware()((Request r) => _updateSubTodoHandler(r, id))(req))
+  ..get('/subscription', _authMiddleware()(_getCurrentSubscriptionHandler))
+  ..post('/subscribe', _authMiddleware()(_subscribeHandler));
 
 // Handler for the signup request.
 Future<Response> _signupHandler(Request request) async {
@@ -560,39 +603,7 @@ Future<Response> _signupHandler(Request request) async {
     final newUserId = insertResult.first[0] as String;
 
     // 5b. Insert default filters and default tags (labels) for the new user.
-    await _db.transaction((tx) async {
-      // Filters (time/status based views)
-      await tx.query(r"""
-        INSERT INTO filters (user_id, name, query, color, is_favorite, description)
-        VALUES
-          (@userId, 'Today', 'due_today', '#3D4CD6', true, 'Tasks due today'),
-          (@userId, 'Overdue', 'overdue', '#EF4444', false, 'Past due tasks'),
-          (@userId, 'This Week', 'this_week', '#F59E0B', false, 'Due in the next 7 days'),
-          (@userId, 'High Priority', 'high_priority', '#D32F2F', false, 'Urgent & important tasks'),
-          (@userId, 'Low Priority', 'low_priority', '#9E9E9E', false, 'Nice-to-have tasks'),
-          (@userId, 'Completed', 'completed', '#2E7D32', true, 'Finished tasks'),
-          (@userId, 'Assigned to Me', 'assigned_to_me', '#FF7043', false, 'Tasks assigned to you')
-      """,
-      substitutionValues: {'userId': newUserId});
-
-      // Tags (labels) — create 10 handy tags for quick categorization
-      await tx.query(r"""
-        INSERT INTO labels (user_id, name, color, is_favorite)
-        VALUES
-          (@userId, 'Work', '#3D4CD6', false),
-          (@userId, 'Personal', '#8E24AA', false),
-          (@userId, 'Urgent', '#EF4444', false),
-          (@userId, 'Meeting', '#0288D1', false),
-          (@userId, 'Follow-up', '#F59E0B', false),
-          (@userId, 'Finance', '#2E7D32', false),
-          (@userId, 'Health', '#E91E63', false),
-          (@userId, 'Learning', '#7C4DFF', false),
-          (@userId, 'Shopping', '#FF7043', false),
-          (@userId, 'Ideas', '#607D8B', false)
-            ,(@userId, 'Default', '#9E9E9E', false)
-      """,
-      substitutionValues: {'userId': newUserId});
-    });
+    await _initializeUserData(newUserId);
 
     // 6. Send the verification email via Maileroo HTTP API.
     final verificationUrl = '${Config.clientBaseUrl}/verify-email?token=${Uri.encodeQueryComponent(verificationToken)}';
@@ -723,6 +734,72 @@ Future<Response> _sendTestEmailHandler(Request request) async {
 }
 
 // Handler for the login request.
+/// Updates the subscription status from Stripe for a given user (owner).
+Future<String> _syncSubscriptionStatus(String ownerId) async {
+  try {
+    final subRes = await _db.query('SELECT stripe_subscription_id, status FROM user_subscriptions WHERE user_id = @id::uuid', substitutionValues: {'id': ownerId});
+    if (subRes.isEmpty) return 'none';
+    
+    final stripeSubId = subRes.first[0] as String?;
+    if (stripeSubId == null || stripeSubId.isEmpty) return 'none';
+
+    final resp = await http.get(
+      Uri.parse('https://api.stripe.com/v1/subscriptions/$stripeSubId'),
+      headers: {'Authorization': 'Bearer ${Config.stripeSecretKey}'},
+    );
+
+    if (resp.statusCode == 200) {
+      final data = json.decode(resp.body);
+      final newStatus = data['status'] as String;
+      
+      // Update DB if changed
+      await _db.query('UPDATE user_subscriptions SET status = @status WHERE user_id = @id::uuid', substitutionValues: {'status': newStatus, 'id': ownerId});
+      return newStatus;
+    }
+  } catch (e) {
+    print('Error syncing subscription status: $e');
+  }
+  return 'error';
+}
+
+/// Checks if the user or their team owner has an active subscription.
+Future<bool> _hasActiveSubscription(String userId) async {
+  try {
+    // 1. Find the "subscription owner" (the person responsible for payment)
+    String ownerId = userId;
+    
+    // Check if user is a member of someone else's team
+    final memberRes = await _db.query('SELECT team_id FROM team_members WHERE user_id = @userId::uuid LIMIT 1', substitutionValues: {'userId': userId});
+    if (memberRes.isNotEmpty) {
+      final teamId = memberRes.first[0] as String;
+      final teamData = await _db.query('SELECT owner_id FROM teams WHERE id = @teamId::uuid', substitutionValues: {'teamId': teamId});
+      if (teamData.isNotEmpty) {
+        ownerId = teamData.first[0] as String;
+      }
+    }
+
+    // 2. See if the owner has a subscription
+    final subStatus = await _syncSubscriptionStatus(ownerId);
+    
+    // Allow 'active' or 'trialing'
+    if (subStatus == 'active' || subStatus == 'trialing') return true;
+    
+    // If no subscription recorded yet, check if they are still onboarding
+    if (subStatus == 'none') {
+      final userRes = await _db.query('SELECT has_completed_onboarding FROM users WHERE id = @userId::uuid', substitutionValues: {'userId': userId});
+      if (userRes.isNotEmpty && !(userRes.first[0] as bool)) {
+        return true; // Allow login to complete onboarding
+      }
+      return false; // Subscription required for completed users
+    }
+
+    return false; // past_due, unpaid, canceled, etc.
+  } catch (e) {
+    print('Error in _hasActiveSubscription: $e');
+    return true; // Fail open to avoid locking everyone out on db error? Or fail closed for security? User said "cannot login" if fail.
+  }
+}
+
 Future<Response> _loginHandler(Request request) async {
   try {
     final bodyString = await request.readAsString();
@@ -735,7 +812,7 @@ Future<Response> _loginHandler(Request request) async {
       return Response(400, body: json.encode({'message': 'Email and password are required.'}));
     }
 
-    // Normalize email for case-insensitive matching
+    // normalization 
     email = email?.trim().toLowerCase();
 
     // 1. Find the user by email (case-insensitive).
@@ -750,6 +827,16 @@ Future<Response> _loginHandler(Request request) async {
 
     final user = result.first;
     final userId = user[0] as String;
+
+    // --- Subscription Check ---
+    final isActive = await _hasActiveSubscription(userId);
+    if (!isActive) {
+      return Response(402, body: json.encode({
+        'message': 'Your subscription is inactive or payment has failed. Please contact the team owner to resolve payment issues.'
+      }));
+    }
+    // --- End Subscription Check ---
+
     final storedHash = user[1] as String;
     final isVerified = user[2] as bool;
     final hasCompletedOnboarding = user[3] as bool;
@@ -801,6 +888,187 @@ Future<Response> _loginHandler(Request request) async {
     print('Error during login: $e');
     print(stackTrace);
     return Response.internalServerError(body: 'An unexpected server error occurred.');
+  }
+}
+
+Future<Response> _googleLoginHandler(Request request) async {
+  try {
+    final bodyString = await request.readAsString();
+    final body = json.decode(bodyString) as Map<String, dynamic>;
+
+    final idToken = body['idToken'] as String?;
+
+    if (idToken == null || idToken.isEmpty) {
+      return Response(400,
+          body: json.encode({'message': 'Google ID Token is required.'}),
+          headers: {'Content-Type': 'application/json'});
+    }
+
+    // Verify token with Google
+    final List<String> issuers = [
+      'https://accounts.google.com',
+      'accounts.google.com'
+    ];
+    
+    final googleVerifyUrl = 'https://oauth2.googleapis.com/tokeninfo?id_token=$idToken';
+    final googleResponse = await http.get(Uri.parse(googleVerifyUrl));
+    
+    if (googleResponse.statusCode != 200) {
+      return Response(401,
+          body: json.encode({'message': 'Invalid Google Token.'}),
+          headers: {'Content-Type': 'application/json'});
+    }
+
+    final payload = json.decode(googleResponse.body) as Map<String, dynamic>;
+    
+    // Safety check: is it actually from Google?
+    if (!issuers.contains(payload['iss'])) {
+       return Response(401,
+          body: json.encode({'message': 'Invalid Token Issuer.'}),
+          headers: {'Content-Type': 'application/json'});
+    }
+
+    final email = payload['email'] as String?;
+    final name = payload['name'] as String?;
+    final profilePicture = payload['picture'] as String?;
+    final emailVerified = payload['email_verified'] == 'true' || payload['email_verified'] == true;
+
+    if (email == null || !emailVerified) {
+      return Response(400,
+          body: json.encode({'message': 'Unverified or missing email from Google.'}),
+          headers: {'Content-Type': 'application/json'});
+    }
+
+    final normalizedEmail = email.trim().toLowerCase();
+
+    // 1. Check if the user exists
+    final result = await _db.query(
+      'SELECT id, is_verified, has_completed_onboarding, name FROM users WHERE LOWER(email) = @email',
+      substitutionValues: {'email': normalizedEmail},
+    );
+
+    String userId;
+    bool hasCompletedOnboarding = false;
+
+    if (result.isEmpty) {
+      // 2. Create new user if not exists (This user is an "Owner" by default unless invited)
+      final randomPassword = Random().nextInt(1000000).toString();
+      final passwordHash = BCrypt.hashpw(randomPassword, BCrypt.gensalt());
+
+      final insertResult = await _db.query(
+        r'''
+        INSERT INTO users (name, email, password_hash, is_verified, has_completed_onboarding, profile_picture_base64)
+        VALUES (@name, @email, @passwordHash, true, false, @profilePicture)
+        RETURNING id
+        ''',
+        substitutionValues: {
+          'name': name ?? email.split('@')[0],
+          'email': normalizedEmail,
+          'passwordHash': passwordHash,
+          'profilePicture': profilePicture,
+        },
+      );
+      userId = insertResult.first[0] as String;
+      hasCompletedOnboarding = false;
+
+      // Insert default filters and labels for the new user
+      await _initializeUserData(userId);
+
+      _logActivity(
+        userId: userId,
+        activityName: 'User Signup (Google)',
+        description: 'New user registered via Google Social Login.',
+      );
+    } else {
+      // 3. User exists, just login
+      userId = result.first[0] as String;
+      final bool alreadyVerified = result.first[1] as bool;
+      hasCompletedOnboarding = result.first[2] as bool;
+      final existingName = result.first[3] as String?;
+
+      // Ensure user has default filters and labels (especially if they were invited)
+      await _initializeUserData(userId);
+
+      // If they exist but weren't verified (e.g. placeholder from invitation), verify them now
+      if (!alreadyVerified) {
+        await _db.query(
+          'UPDATE users SET is_verified = true, name = @name, profile_picture_base64 = @profilePicture WHERE id = @id::uuid',
+          substitutionValues: {
+            'id': userId,
+            'name': (existingName == null || existingName.isEmpty)
+                ? (name ?? email.split('@')[0])
+                : existingName,
+            'profilePicture': profilePicture,
+          },
+        );
+      }
+
+      _logActivity(
+        userId: userId,
+        activityName: 'User Login (Google)',
+        description: 'User successfully logged in via Google.',
+      );
+    }
+
+    // --- Subscription Check ---
+    final isActive = await _hasActiveSubscription(userId);
+    if (!isActive && hasCompletedOnboarding) {
+      return Response(402, body: json.encode({
+        'message': 'Your subscription is inactive or payment has failed. Please contact the team owner.'
+      }), headers: {'Content-Type': 'application/json'});
+    }
+    // --- End Subscription Check ---
+
+    // 4. Handle Pending Invitations (Auto-accept)
+    final pendingInvites = await _db.query(
+      "SELECT id, team_id FROM invitations WHERE LOWER(email) = @email AND status = 'pending'",
+      substitutionValues: {'email': normalizedEmail},
+    );
+
+    for (final invite in pendingInvites) {
+      final inviteId = invite[0] as String;
+      final teamId = invite[1] as String;
+
+      // Update invitation status
+      await _db.query(
+        "UPDATE invitations SET status = 'accepted', accepted_at = now(), invited_user_id = @userId::uuid WHERE id = @inviteId::uuid",
+        substitutionValues: {'userId': userId, 'inviteId': inviteId},
+      );
+
+      // Add to team_members
+      await _db.query(
+        "INSERT INTO team_members (team_id, user_id, role) VALUES (@teamId::uuid, @userId::uuid, 'member') ON CONFLICT DO NOTHING",
+        substitutionValues: {'teamId': teamId, 'userId': userId},
+      );
+    }
+
+    // 5. Generate a JWT.
+    final jwt = JWT({'id': userId});
+    final token = jwt.sign(SecretKey(Config.jwtSecret),
+        expiresIn: const Duration(days: 7));
+
+    // Determine if this user is a "Member" (joined via invitation)
+    bool isMember = false;
+    final teamMemberCheck = await _db.query(
+      "SELECT id FROM team_members WHERE user_id = @userId::uuid LIMIT 1",
+      substitutionValues: {'userId': userId},
+    );
+    isMember = teamMemberCheck.isNotEmpty;
+
+    return Response.ok(
+      json.encode({
+        'token': token,
+        'user_id': userId,
+        'invited': isMember,
+        'has_completed_onboarding': hasCompletedOnboarding,
+      }),
+      headers: {'Content-Type': 'application/json'},
+    );
+  } catch (e, stackTrace) {
+    print('Error during Google login: $e');
+    print(stackTrace);
+    return Response.internalServerError(
+        body: 'An unexpected server error occurred.');
   }
 }
 
@@ -937,7 +1205,7 @@ Future<Response> _getFiltersHandler(Request request) async {
     }
 
     final result = await _db.query(
-      'SELECT id, name, query, color, is_favorite, created_at, description FROM filters WHERE user_id = @userId ORDER BY created_at DESC',
+      'SELECT id, name, query, color, is_favorite, created_at, description FROM filters WHERE user_id = @userId::uuid ORDER BY created_at DESC',
       substitutionValues: {'userId': userId},
     );
 
@@ -986,7 +1254,7 @@ Future<Response> _createFilterHandler(Request request) async {
     final result = await _db.query(
       r'''
       INSERT INTO filters (user_id, name, query, color, is_favorite, description)
-      VALUES (@userId, @name, @query, @color, @isFavorite, @description)
+      VALUES (@userId::uuid, @name, @query, @color, @isFavorite, @description)
       RETURNING id, name, query, color, is_favorite, created_at, description
       ''',
       substitutionValues: {
@@ -1037,13 +1305,13 @@ Future<Response> _updateFilterHandler(Request request, String id) async {
     if (isFavorite == null) return Response(400, body: json.encode({'message': 'is_favorite (boolean) is required.'}), headers: {'Content-Type': 'application/json'});
 
     // Ensure ownership
-    final existing = await _db.query('SELECT user_id FROM filters WHERE id = @id LIMIT 1', substitutionValues: {'id': id});
+    final existing = await _db.query('SELECT user_id FROM filters WHERE id = @id::uuid LIMIT 1', substitutionValues: {'id': id});
     if (existing.isEmpty) return Response(404, body: json.encode({'message': 'Filter not found.'}), headers: {'Content-Type': 'application/json'});
     final ownerId = existing.first[0] as String;
     if (ownerId != userId) return Response.forbidden('Not authorized to modify this filter.');
 
     final result = await _db.query(r'''
-      UPDATE filters SET is_favorite = @isFavorite, created_at = created_at WHERE id = @id AND user_id = @userId RETURNING id, name, query, color, is_favorite, created_at, description
+      UPDATE filters SET is_favorite = @isFavorite, created_at = created_at WHERE id = @id::uuid AND user_id = @userId::uuid RETURNING id, name, query, color, is_favorite, created_at, description
     ''', substitutionValues: {'isFavorite': isFavorite, 'id': id, 'userId': userId});
 
     if (result.isEmpty) return Response.internalServerError(body: json.encode({'message': 'Failed to update filter.'}), headers: {'Content-Type': 'application/json'});
@@ -1068,7 +1336,7 @@ Future<Response> _deleteFilterHandler(Request request, String id) async {
     }
     // Prevent deleting the default/system filter.
     final check = await _db.query(
-      'SELECT name, query FROM filters WHERE id = @id AND user_id = @userId',
+      'SELECT name, query FROM filters WHERE id = @id::uuid AND user_id = @userId::uuid',
       substitutionValues: {'id': id, 'userId': userId},
     );
     if (check.isEmpty) {
@@ -1082,7 +1350,7 @@ Future<Response> _deleteFilterHandler(Request request, String id) async {
     }
 
     final result = await _db.query(
-      'DELETE FROM filters WHERE id = @id AND user_id = @userId',
+      'DELETE FROM filters WHERE id = @id::uuid AND user_id = @userId::uuid',
       substitutionValues: {'id': id, 'userId': userId},
     );
 
@@ -1114,7 +1382,7 @@ Future<Response> _deleteLabelHandler(Request request, String id) async {
     }
     // Prevent deleting the default/system label.
     final check = await _db.query(
-      'SELECT name FROM labels WHERE id = @id AND user_id = @userId',
+      'SELECT name FROM labels WHERE id = @id::uuid AND user_id = @userId::uuid',
       substitutionValues: {'id': id, 'userId': userId},
     );
     if (check.isEmpty) {
@@ -1126,7 +1394,7 @@ Future<Response> _deleteLabelHandler(Request request, String id) async {
     }
 
     final result = await _db.query(
-      'DELETE FROM labels WHERE id = @id AND user_id = @userId',
+      'DELETE FROM labels WHERE id = @id::uuid AND user_id = @userId::uuid',
       substitutionValues: {'id': id, 'userId': userId},
     );
 
@@ -1158,7 +1426,7 @@ Future<Response> _getLabelsHandler(Request request) async {
     }
 
     final result = await _db.query(
-      'SELECT id, name, color, is_favorite, created_at FROM labels WHERE user_id = @userId ORDER BY created_at DESC',
+      'SELECT id, name, color, is_favorite, created_at FROM labels WHERE user_id = @userId::uuid ORDER BY created_at DESC',
       substitutionValues: {'userId': userId},
     );
 
@@ -1200,7 +1468,7 @@ Future<Response> _createLabelHandler(Request request) async {
     final result = await _db.query(
       r'''
       INSERT INTO labels (user_id, name, color, is_favorite)
-      VALUES (@userId, @name, @color, @isFavorite)
+      VALUES (@userId::uuid, @name, @color, @isFavorite)
       RETURNING id, name, color, is_favorite, created_at
       ''',
       substitutionValues: {
@@ -1228,6 +1496,64 @@ Future<Response> _createLabelHandler(Request request) async {
     print('Error creating label: $e');
     print(stackTrace);
     return Response.internalServerError(body: 'An unexpected server error occurred.');
+  }
+}
+
+// Handler for updating an existing label.
+Future<Response> _updateLabelHandler(Request request, String id) async {
+  try {
+    final userId = request.context['userId'] as String?;
+    if (userId == null) {
+      return Response.forbidden('Not authorized.');
+    }
+
+    final bodyString = await request.readAsString();
+    final body = json.decode(bodyString) as Map<String, dynamic>;
+
+    final name = body['name'] as String?;
+    final color = body['color'] as String?;
+    final isFavorite = body['is_favorite'] as bool?;
+
+    // Validate that the label belongs to the user
+    final existingLabel = await _db.query(
+      'SELECT id FROM labels WHERE id = @id::uuid AND user_id = @userId::uuid LIMIT 1',
+      substitutionValues: {'id': id, 'userId': userId},
+    );
+
+    if (existingLabel.isEmpty) {
+      return Response(404, body: json.encode({'message': 'Label not found or not owned by you.'}));
+    }
+
+    final result = await _db.query(
+      r'''
+      UPDATE labels
+      SET name = @name, color = @color, is_favorite = @isFavorite
+      WHERE id = @id::uuid AND user_id = @userId::uuid
+      RETURNING id, name, color, is_favorite, created_at
+      ''',
+      substitutionValues: {
+        'id': id,
+        'userId': userId,
+        'name': name,
+        'color': color,
+        'isFavorite': isFavorite,
+      },
+    );
+
+    if (result.isEmpty) {
+      return Response(400, body: json.encode({'message': 'Update failed.'}));
+    }
+
+    final updatedLabelMap = result.first.toColumnMap();
+    if (updatedLabelMap['created_at'] is DateTime) {
+      updatedLabelMap['created_at'] = (updatedLabelMap['created_at'] as DateTime).toIso8601String();
+    }
+
+    return Response.ok(json.encode(updatedLabelMap), headers: {'Content-Type': 'application/json'});
+  } catch (e, stackTrace) {
+    print('Error updating label: $e');
+    print(stackTrace);
+    return Response.internalServerError(body: json.encode({'message': 'An unexpected server error occurred.'}), headers: {'Content-Type': 'application/json'});
   }
 }
 
@@ -1260,7 +1586,7 @@ Future<Response> _createTodoHandler(Request request) async {
     final result = await _db.query(
       r'''
       INSERT INTO todos (user_id, title, description, project_name, project_id, due_date, due_time, repeat_value, priority, label_id)
-      VALUES (@userId, @title, @description, @projectName, @projectId, @dueDate, @dueTime, @repeatValue, @priority, @labelId)
+      VALUES (@userId::uuid, @title, @description, @projectName, @projectId::uuid, @dueDate, @dueTime, @repeatValue, @priority, @labelId::uuid)
       RETURNING *
       ''',
       substitutionValues: {
@@ -1319,11 +1645,24 @@ Future<Response> _getTodosHandler(Request request) async {
     final bool hasClientDate = clientDateStr != null && clientDateStr.isNotEmpty;
     String baseQuery = r'''
       SELECT 
-        t.id, t.title, t.description, t.project_name, t.project_id, t.due_date, t.due_time, t.repeat_value, t.priority, t.is_completed, t.created_at,
-        l.name as label_name, l.color as label_color
+        t.id, t.title, t.description, t.project_name, t.project_id, t.team_id, t.due_date, t.due_time, t.repeat_value, t.priority, t.is_completed, t.created_at,
+        l.name as label_name, l.color as label_color,
+        tm.name as team_name
       FROM todos t
-      LEFT JOIN labels l ON t.label_id = l.id
-      WHERE t.user_id = @userId::uuid
+      LEFT JOIN labels l ON t.label_id = l.id AND l.user_id = @userId::uuid
+      LEFT JOIN teams tm ON t.team_id = tm.id
+      WHERE (
+        t.user_id = @userId::uuid 
+        OR 
+        t.team_id IN (SELECT team_id FROM team_members WHERE user_id = @userId::uuid)
+        OR
+        t.project_id IN (
+           SELECT p.id FROM projects p 
+           WHERE p.owner_id = @userId::uuid 
+              OR p.access_type = 'everyone' 
+              OR (p.access_type = 'team' AND p.team_id IN (SELECT team_id FROM team_members WHERE user_id = @userId::uuid))
+        )
+      )
     ''';
 
     if (projectId != null && projectId.isNotEmpty) {
@@ -1333,24 +1672,29 @@ Future<Response> _getTodosHandler(Request request) async {
     // Append filter-specific conditions
     final dateExpr = hasClientDate ? "DATE(@clientDate)" : "CURRENT_DATE";
 
-    if (filter == 'due_today' || filter == 'today') {
-      baseQuery += " AND (DATE(t.due_date) = $dateExpr)";
-    } else if (filter == 'overdue') {
-      baseQuery += " AND t.is_completed = false AND (t.due_date IS NOT NULL AND DATE(t.due_date) < $dateExpr)";
-    } else if (filter == 'this_week') {
-      // Calculate week boundaries explicitly so we return only todos due within
-      // the same calendar week (Mon-Sun by PostgreSQL's date_trunc('week')).
-      if (hasClientDate) {
-        baseQuery += " AND (t.due_date IS NOT NULL AND DATE(t.due_date) >= (DATE(date_trunc('week', DATE(@clientDate)))) AND DATE(t.due_date) < (DATE(date_trunc('week', DATE(@clientDate))) + INTERVAL '7 days'))";
-      } else {
-        baseQuery += " AND (t.due_date IS NOT NULL AND DATE(t.due_date) >= (DATE(date_trunc('week', CURRENT_DATE))) AND DATE(t.due_date) < (DATE(date_trunc('week', CURRENT_DATE)) + INTERVAL '7 days'))";
-      }
-    } else if (filter == 'high_priority') {
-      baseQuery += " AND t.priority = 1";
-    } else if (filter == 'low_priority') {
-      baseQuery += " AND t.priority = 4";
-    } else if (filter == 'completed') {
+    if (filter == 'completed') {
       baseQuery += " AND t.is_completed = true";
+    } else {
+      // For ALL other lists, only show incomplete tasks
+      baseQuery += " AND t.is_completed = false";
+
+      if (filter == 'due_today' || filter == 'today') {
+        baseQuery += " AND (DATE(t.due_date) = $dateExpr)";
+      } else if (filter == 'overdue') {
+        baseQuery += " AND (t.due_date IS NOT NULL AND DATE(t.due_date) < $dateExpr)";
+      } else if (filter == 'this_week') {
+        // Calculate week boundaries explicitly so we return only todos due within
+        // the same calendar week (Mon-Sun by PostgreSQL's date_trunc('week')).
+        if (hasClientDate) {
+          baseQuery += " AND (t.due_date IS NOT NULL AND DATE(t.due_date) >= (DATE(date_trunc('week', DATE(@clientDate)))) AND DATE(t.due_date) < (DATE(date_trunc('week', DATE(@clientDate))) + INTERVAL '7 days'))";
+        } else {
+          baseQuery += " AND (t.due_date IS NOT NULL AND DATE(t.due_date) >= (DATE(date_trunc('week', CURRENT_DATE))) AND DATE(t.due_date) < (DATE(date_trunc('week', CURRENT_DATE)) + INTERVAL '7 days'))";
+        }
+      } else if (filter == 'high_priority') {
+        baseQuery += " AND t.priority = 1";
+      } else if (filter == 'low_priority') {
+        baseQuery += " AND t.priority = 4";
+      }
     }
 
     baseQuery += " ORDER BY t.created_at DESC";
@@ -1400,7 +1744,7 @@ Future<Response> _updateTodoHandler(Request request, String id) async {
     final body = json.decode(bodyString) as Map<String, dynamic>;
 
     // Ensure the todo belongs to the user
-    final existing = await _db.query('SELECT user_id, is_completed, title, description FROM todos WHERE id = @id LIMIT 1', substitutionValues: {'id': id});
+    final existing = await _db.query('SELECT user_id, is_completed, title, description FROM todos WHERE id = @id::uuid LIMIT 1', substitutionValues: {'id': id});
     if (existing.isEmpty) return Response(404, body: json.encode({'message': 'Todo not found.'}), headers: {'Content-Type': 'application/json'});
     final ownerId = existing.first[0] as String;
     final currentlyCompleted = existing.first[1] as bool;
@@ -1447,6 +1791,15 @@ Future<Response> _updateTodoHandler(Request request, String id) async {
     if (body.containsKey('project_id')) {
       updates['projectId'] = body['project_id'];
       setClauses.add('project_id = @projectId::uuid');
+    }
+
+    if (body.containsKey('team_id')) {
+      updates['teamId'] = body['team_id'];
+      if (updates['teamId'] == null) {
+        setClauses.add('team_id = NULL');
+      } else {
+        setClauses.add('team_id = @teamId::uuid');
+      }
     }
 
     if (setClauses.isEmpty) {
@@ -1545,16 +1898,16 @@ Future<Response> _verifyHandler(Request request) async {
       }
 
       // Mark user verified
-      await _db.query('UPDATE users SET is_verified = true, verification_token = NULL, verification_token_expires_at = NULL WHERE id = @id', substitutionValues: {'id': userId});
+      await _db.query('UPDATE users SET is_verified = true, verification_token = NULL, verification_token_expires_at = NULL WHERE id = @id::uuid', substitutionValues: {'id': userId});
 
       // Add to team if not already
-      final exists = await _db.query('SELECT id FROM team_members WHERE team_id = @team AND user_id = @user', substitutionValues: {'team': teamId, 'user': userId});
+      final exists = await _db.query('SELECT id FROM team_members WHERE team_id = @team::uuid AND user_id = @user::uuid', substitutionValues: {'team': teamId, 'user': userId});
       if (exists.isEmpty) {
-        await _db.query('INSERT INTO team_members (team_id, user_id, role) VALUES (@team, @user, @role)', substitutionValues: {'team': teamId, 'user': userId, 'role': 'member'});
+        await _db.query('INSERT INTO team_members (team_id, user_id, role) VALUES (@team::uuid, @user::uuid, @role)', substitutionValues: {'team': teamId, 'user': userId, 'role': 'member'});
       }
 
       // Update invitation status
-      await _db.query('UPDATE invitations SET status = @status, accepted_at = @accepted WHERE id = @id', substitutionValues: {'status': 'accepted', 'accepted': DateTime.now().toIso8601String(), 'id': invitationId});
+      await _db.query('UPDATE invitations SET status = @status, accepted_at = @accepted WHERE id = @id::uuid', substitutionValues: {'status': 'accepted', 'accepted': DateTime.now().toIso8601String(), 'id': invitationId});
 
       // Generate JWT so the user can be logged in immediately
       final jwtToken = JWT({'id': userId}).sign(SecretKey(Config.jwtSecret), expiresIn: const Duration(days: 7));
@@ -1577,7 +1930,7 @@ Future<Response> _verifyHandler(Request request) async {
 
     // Update user to be verified
     await _db.query(
-      'UPDATE users SET is_verified = true, verification_token = NULL, verification_token_expires_at = NULL WHERE id = @id',
+      'UPDATE users SET is_verified = true, verification_token = NULL, verification_token_expires_at = NULL WHERE id = @id::uuid',
       substitutionValues: {'id': userId},
     );
 
@@ -1590,11 +1943,11 @@ Future<Response> _verifyHandler(Request request) async {
         final teamId = inv['team_id'] as String;
         final status = inv['status'] as String?;
         if (status != 'accepted') {
-          final exists = await _db.query('SELECT id FROM team_members WHERE team_id = @team AND user_id = @user', substitutionValues: {'team': teamId, 'user': userId});
+          final exists = await _db.query('SELECT id FROM team_members WHERE team_id = @team::uuid AND user_id = @user::uuid', substitutionValues: {'team': teamId, 'user': userId});
           if (exists.isEmpty) {
-            await _db.query('INSERT INTO team_members (team_id, user_id, role) VALUES (@team, @user, @role)', substitutionValues: {'team': teamId, 'user': userId, 'role': 'member'});
+            await _db.query('INSERT INTO team_members (team_id, user_id, role) VALUES (@team::uuid, @user::uuid, @role)', substitutionValues: {'team': teamId, 'user': userId, 'role': 'member'});
           }
-          await _db.query('UPDATE invitations SET status = @status, accepted_at = @accepted, invited_user_id = @uid WHERE id = @id', substitutionValues: {'status': 'accepted', 'accepted': DateTime.now().toIso8601String(), 'uid': userId, 'id': invitationId});
+          await _db.query('UPDATE invitations SET status = @status, accepted_at = @accepted, invited_user_id = @uid::uuid WHERE id = @id::uuid', substitutionValues: {'status': 'accepted', 'accepted': DateTime.now().toIso8601String(), 'uid': userId, 'id': invitationId});
         }
       }
     } catch (e) {
@@ -1701,6 +2054,7 @@ Future<Response> _saveActivityHandler(Request request) async {
 
 // Handler for updating user profile (name).
 Future<Response> _updateProfileHandler(Request request) async {
+  print('Entering _updateProfileHandler...');
   try {
     final userId = request.context['userId'] as String?;
     if (userId == null) return Response.forbidden('Not authorized.');
@@ -1714,7 +2068,7 @@ Future<Response> _updateProfileHandler(Request request) async {
     }
 
     await _db.query(
-      'UPDATE users SET name = @name WHERE id = @id',
+      'UPDATE users SET name = @name WHERE id = @id::uuid',
       substitutionValues: {'name': name, 'id': userId},
     );
 
@@ -1783,7 +2137,7 @@ Future<Response> _uploadAvatarHandler(Request request) async {
       }
 
     await _db.query(
-      'UPDATE users SET profile_picture_base64 = @b64 WHERE id = @id',
+      'UPDATE users SET profile_picture_base64 = @b64 WHERE id = @id::uuid',
       substitutionValues: {'b64': profileBase64, 'id': userId},
     );
 
@@ -1968,6 +2322,7 @@ Future<Response> _addNoteHandler(Request request) async {
 }
 
 void main(List<String> args) async {
+  print('--- SERVER STARTING [v1.0.3 - 18:25] ---');
   // Load environment variables from .env (required for Config getters below)
   Config.load();
   // --- Database Connection ---
@@ -1988,6 +2343,7 @@ void main(List<String> args) async {
     await _ensureNotesTable();
     await _ensureCommentsTable();
     await _ensureSubTodosTable();
+    await _ensureSubscriptionTables();
   } catch (e, st) {
     print('Error ensuring database schema is up to date: $e');
     print(st);
@@ -2007,12 +2363,10 @@ void main(List<String> args) async {
     uploadsDir.createSync(recursive: true);
   }
 
-  // Combine public and private routes. Apply auth middleware only to private routes.
+  // Combine static files with the main router.
   final cascade = Cascade()
-      .add(createStaticHandler('public'))
-      .add(_publicRouter)
-      .add(_publicInviteRouter)
-      .add(_authMiddleware()(_privateRouter));
+      .add(_mainRouter)
+      .add(createStaticHandler('public'));
 
   final handler = const Pipeline()
       .addMiddleware(logRequests()) // Log all incoming requests.
@@ -2031,7 +2385,7 @@ Future<Response> _getAvatarHandler(Request request) async {
     if (userId == null) return Response.forbidden('Not authorized.');
 
     final result = await _db.query(
-      'SELECT profile_picture_base64 FROM users WHERE id = @id',
+      'SELECT profile_picture_base64 FROM users WHERE id = @id::uuid',
       substitutionValues: {'id': userId},
     );
 
@@ -2068,7 +2422,44 @@ Future<Response> _inviteHandler(Request request) async {
     }
 
     if (emails.isEmpty) return Response(400, body: json.encode({'message': 'No emails provided.'}));
-    if (emails.length > 5) return Response(400, body: json.encode({'message': 'You can invite up to 5 members.'}));
+    
+    // --- Subscription Enforcement ---
+    final subRows = await _db.query(r"""
+      SELECT sp.member_limit 
+      FROM user_subscriptions us 
+      JOIN subscription_plans sp ON us.plan_id = sp.id 
+      WHERE us.user_id = @userId::uuid
+    """, substitutionValues: {'userId': inviterId});
+
+    if (subRows.isEmpty) {
+      return Response(402, body: json.encode({'message': 'A subscription is required to invite team members.'}));
+    }
+
+    final memberLimit = subRows.first[0] as int;
+
+    // Count existing members + pending invites
+    // First, find the team this user owns
+    final teamRes = await _db.query('SELECT id FROM teams WHERE owner_id = @owner', substitutionValues: {'owner': inviterId});
+    String? currentTeamId;
+    if (teamRes.isNotEmpty) {
+      currentTeamId = teamRes.first[0] as String;
+    }
+
+    if (currentTeamId != null) {
+      final currentMembersRes = await _db.query('SELECT COUNT(*) FROM team_members WHERE team_id = @team', substitutionValues: {'team': currentTeamId});
+      final currentMembers = currentMembersRes.first[0] as int;
+      
+      final pendingInvitesRes = await _db.query("SELECT COUNT(*) FROM invitations WHERE team_id = @team AND status = 'pending'", substitutionValues: {'team': currentTeamId});
+      final pendingInvites = pendingInvitesRes.first[0] as int;
+
+      // The limit includes the owner + all members (invited and joined)
+      if (1 + currentMembers + pendingInvites + emails.length > memberLimit) {
+        return Response(400, body: json.encode({
+          'message': 'You have reached the total member limit for your plan ($memberLimit people). Please upgrade your subscription.'
+        }));
+      }
+    }
+    // --- End Subscription Enforcement ---
 
     // Rate-limit: prevent abuse by limiting invites per inviter to 10 per hour
     final recentCountRes = await _db.query(
@@ -2323,6 +2714,9 @@ Future<Response> _setPasswordForInviteHandler(Request request) async {
     final hashed = BCrypt.hashpw(password, BCrypt.gensalt());
     await _db.query('UPDATE users SET password_hash = @hash, is_verified = true, verification_token = NULL, verification_token_expires_at = NULL WHERE id = @id', substitutionValues: {'hash': hashed, 'id': invitedUserId});
 
+    // Ensure the invited user has their default filters and labels
+    await _initializeUserData(invitedUserId);
+
     // Add to team if not already
     final exists = await _db.query('SELECT id FROM team_members WHERE team_id = @team AND user_id = @user', substitutionValues: {'team': teamId, 'user': invitedUserId});
     if (exists.isEmpty) {
@@ -2345,23 +2739,36 @@ Future<Response> _setPasswordForInviteHandler(Request request) async {
 
 // Handler to retrieve user's profile (name, email, avatar base64)
 Future<Response> _getProfileHandler(Request request) async {
+  print('Entering _getProfileHandler...');
   try {
     final userId = request.context['userId'] as String?;
     if (userId == null) return Response.forbidden('Not authorized.');
 
     final result = await _db.query(
-      'SELECT name, email, profile_picture_base64, has_completed_onboarding FROM users WHERE id = @id',
+      'SELECT name, email, profile_picture_base64, has_completed_onboarding FROM users WHERE id = @id::uuid',
       substitutionValues: {'id': userId},
     );
 
-    if (result.isEmpty) return Response.notFound(json.encode({'message': 'User not found.'}));
+    if (result.isEmpty) {
+      print('DB Result: No user found for ID: $userId');
+      return Response.notFound(json.encode({'message': 'User not found.'}));
+    }
 
     final row = result.first.toColumnMap();
+
+    // Check if user is a member of any team (to decide onboarding flow)
+    final teamMemberRows = await _db.query(
+      'SELECT 1 FROM team_members WHERE user_id = @userId::uuid LIMIT 1',
+      substitutionValues: {'userId': userId},
+    );
+    final isMember = teamMemberRows.isNotEmpty;
+
     return Response.ok(json.encode({
       'name': row['name'],
       'email': row['email'],
       'profile_picture_base64': row['profile_picture_base64'],
       'has_completed_onboarding': row['has_completed_onboarding'],
+      'invited': isMember,
     }), headers: {'Content-Type': 'application/json'});
   } catch (e, stackTrace) {
     print('Error retrieving profile: $e');
@@ -2640,6 +3047,58 @@ Future<Response> _toggleSubTodoHandler(Request request, String id) async {
   }
 }
 
+Future<Response> _updateSubTodoHandler(Request request, String id) async {
+  try {
+    final userId = request.context['userId'] as String?;
+    if (userId == null) return Response.forbidden('Not authorized.');
+
+    final body = json.decode(await request.readAsString()) as Map<String, dynamic>;
+    
+    final updates = <String, dynamic>{};
+    final List<String> setClauses = [];
+
+    if (body.containsKey('title')) {
+      updates['title'] = body['title'];
+      setClauses.add('title = @title');
+    }
+    if (body.containsKey('description')) {
+      updates['description'] = body['description'];
+      setClauses.add('description = @description');
+    }
+    if (body.containsKey('due_date')) {
+      updates['dueDate'] = body['due_date'];
+      setClauses.add('due_date = @dueDate');
+    }
+    if (body.containsKey('due_time')) {
+      updates['dueTime'] = body['due_time'];
+      setClauses.add('due_time = @dueTime');
+    }
+    if (body.containsKey('priority')) {
+      updates['priority'] = body['priority'];
+      setClauses.add('priority = @priority');
+    }
+    if (body.containsKey('label_id')) {
+      updates['labelId'] = body['label_id'];
+      setClauses.add('label_id = @labelId::uuid');
+    }
+
+    if (setClauses.isEmpty) {
+       return Response.ok(json.encode({'success': true, 'message': 'No changes made.'}));
+    }
+
+    updates['id'] = id;
+    final query = 'UPDATE sub_todos SET ${setClauses.join(', ')} WHERE id = @id::uuid';
+    
+    await _db.query(query, substitutionValues: updates);
+
+    return Response.ok(json.encode({'success': true, 'message': 'Sub-to do updated.'}));
+  } catch (e, st) {
+    print('Error in _updateSubTodoHandler: $e');
+    print(st);
+    return Response.internalServerError(body: json.encode({'message': 'Server error.'}));
+  }
+}
+
 Future<Response> _addCommentHandler(Request request) async {
   try {
     final userId = request.context['userId'] as String?;
@@ -2672,7 +3131,7 @@ Future<Response> _getCommentsHandler(Request request, String todoId) async {
     if (userId == null) return Response.forbidden('Not authorized.');
 
     final rows = await _db.query(r"""
-      SELECT c.id, c.text, c.created_at, u.name as author_name
+      SELECT c.id, c.text, c.created_at, u.name as author_name, u.profile_picture_base64
       FROM comments c
       JOIN users u ON u.id = c.user_id
       WHERE c.todo_id = @todoId::uuid
@@ -2738,5 +3197,406 @@ Future<Response> _checkMemberHandler(Request request) async {
     print('Error in _checkMemberHandler: $e');
     print(st);
     return Response.internalServerError(body: json.encode({'message': 'Server error.'}));
+  }
+}
+
+Future<void> _initializeUserData(String userId) async {
+  await _db.transaction((tx) async {
+    // Check and set default filters
+    final existingFilters = await tx.query('SELECT 1 FROM filters WHERE user_id = @userId::uuid LIMIT 1', substitutionValues: {'userId': userId});
+    if (existingFilters.isEmpty) {
+      await tx.query(r"""
+        INSERT INTO filters (user_id, name, query, color, is_favorite, description)
+        VALUES
+          (@userId::uuid, 'Today', 'due_today', '#3D4CD6', true, 'Tasks due today'),
+          (@userId::uuid, 'Overdue', 'overdue', '#EF4444', false, 'Past due tasks'),
+          (@userId::uuid, 'This Week', 'this_week', '#F59E0B', false, 'Due in the next 7 days'),
+          (@userId::uuid, 'High Priority', 'high_priority', '#D32F2F', false, 'Urgent & important tasks'),
+          (@userId::uuid, 'Low Priority', 'low_priority', '#9E9E9E', false, 'Nice-to-have tasks'),
+          (@userId::uuid, 'Completed', 'completed', '#2E7D32', true, 'Finished tasks'),
+          (@userId::uuid, 'Assigned to Me', 'assigned_to_me', '#FF7043', false, 'Tasks assigned to you')
+      """, substitutionValues: {'userId': userId});
+    }
+
+    // Check and set default labels (tags) -> Removed default label creation as per user request.
+    // final existingLabels = await tx.query('SELECT 1 FROM labels WHERE user_id = @userId::uuid LIMIT 1', substitutionValues: {'userId': userId});
+    // if (existingLabels.isEmpty) {
+    //   await tx.query(r"""
+    //     INSERT INTO labels (user_id, name, color, is_favorite)
+    //     VALUES
+    //       (@userId::uuid, 'Work', '#3D4CD6', false),
+    //       (@userId::uuid, 'Personal', '#8E24AA', false),
+    //       (@userId::uuid, 'Urgent', '#EF4444', false),
+    //       (@userId::uuid, 'Meeting', '#0288D1', false),
+    //       (@userId::uuid, 'Follow-up', '#F59E0B', false),
+    //       (@userId::uuid, 'Finance', '#2E7D32', false),
+    //       (@userId::uuid, 'Health', '#E91E63', false),
+    //       (@userId::uuid, 'Learning', '#7C4DFF', false),
+    //       (@userId::uuid, 'Shopping', '#FF7043', false),
+    //       (@userId::uuid, 'Ideas', '#607D8B', false),
+    //       (@userId::uuid, 'Default', '#9E9E9E', false)
+    //   """, substitutionValues: {'userId': userId});
+    // }
+  });
+}
+
+// Ensure subscription tables exist and seed default plans.
+Future<void> _ensureSubscriptionTables() async {
+  try {
+    await _db.query(r"""
+      CREATE TABLE IF NOT EXISTS public.subscription_plans (
+          id uuid DEFAULT public.uuid_generate_v4() PRIMARY KEY,
+          name character varying(100) UNIQUE NOT NULL,
+          member_limit integer NOT NULL,
+          price numeric(10,2) NOT NULL,
+          stripe_price_id character varying(255),
+          created_at timestamp with time zone DEFAULT now() NOT NULL
+      );
+    """);
+
+    await _db.query(r"""
+      CREATE TABLE IF NOT EXISTS public.user_subscriptions (
+          id uuid DEFAULT public.uuid_generate_v4() PRIMARY KEY,
+          user_id uuid NOT NULL UNIQUE,
+          plan_id uuid NOT NULL,
+          stripe_customer_id character varying(255),
+          stripe_subscription_id character varying(255),
+          card_last_four character varying(4),
+          card_brand character varying(50),
+          status character varying(20) DEFAULT 'active' NOT NULL,
+          created_at timestamp with time zone DEFAULT now() NOT NULL,
+          FOREIGN KEY (user_id) REFERENCES public.users(id),
+          FOREIGN KEY (plan_id) REFERENCES public.subscription_plans(id)
+      );
+    """);
+
+    // Table to track trial usage by email to prevent abuse
+    await _db.query(r"""
+      CREATE TABLE IF NOT EXISTS public.trial_usage (
+          email character varying(255) PRIMARY KEY,
+          used_at timestamp with time zone DEFAULT now() NOT NULL
+      );
+    """);
+
+    // Add stripe_price_id column if it doesn't exist
+    await _db.query(r"""
+      DO $$
+      BEGIN
+        IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='subscription_plans' AND column_name='stripe_price_id') THEN
+          ALTER TABLE subscription_plans ADD COLUMN stripe_price_id VARCHAR(255);
+        END IF;
+      END
+      $$;
+    """);
+
+    // Seed default plans (User needs to fill in their own Stripe Price IDs later)
+    final res = await _db.query('SELECT COUNT(*) FROM subscription_plans');
+    final count = res.first[0] as int;
+    if (count == 0) {
+      await _db.query(r"""
+        INSERT INTO subscription_plans (name, member_limit, price, stripe_price_id) VALUES
+        ('Lite', 2, 5.00, 'placeholder'),
+        ('Pro', 5, 10.00, 'placeholder'),
+        ('Elite', 10, 15.00, 'placeholder')
+      """);
+      print('Seeded subscription plans: Lite, Pro, Elite.');
+    }
+
+    // Automatically sync these plans with Stripe to get real Price IDs
+    await _syncPlansWithStripe();
+  } catch (e, st) {
+    print('Failed to ensure subscription tables: $e');
+    print(st);
+    rethrow;
+  }
+}
+
+/// Automatically creates Products and Prices in Stripe for plans that don't have them.
+Future<void> _syncPlansWithStripe() async {
+  if (Config.stripeSecretKey.isEmpty) {
+    print('Skipping Stripe plan sync: STRIPE_SECRET_KEY is not set.');
+    return;
+  }
+
+  try {
+    final rows = await _db.query('SELECT id, name, price, stripe_price_id FROM subscription_plans');
+    for (final row in rows) {
+      final planData = row.toColumnMap();
+      final planId = planData['id'];
+      final name = planData['name'] as String;
+      final price = double.tryParse(planData['price'].toString()) ?? 0.0;
+      final currentStripeId = planData['stripe_price_id'] as String?;
+
+      if (currentStripeId == null || currentStripeId == 'placeholder' || currentStripeId.startsWith('price_')) {
+        // Even if it starts with price_, we might want to verify or just skip.
+        // For simplicity, let's only create if it's 'placeholder' or null.
+        if (currentStripeId != null && currentStripeId != 'placeholder') continue;
+
+        print('Creating Stripe product and price for plan: $name (\$${price})...');
+
+        // 1. Create Product
+        final prodResp = await http.post(
+          Uri.parse('https://api.stripe.com/v1/products'),
+          headers: {
+            'Authorization': 'Bearer ${Config.stripeSecretKey}',
+            'Content-Type': 'application/x-www-form-urlencoded',
+          },
+          body: {
+            'name': 'Klarto $name Plan',
+            'description': 'Subscription for Klarto $name plan with specific member limits.',
+          },
+        );
+
+        if (prodResp.statusCode != 200) {
+          print('Failed to create Stripe product for $name: ${prodResp.body}');
+          continue;
+        }
+        final productId = json.decode(prodResp.body)['id'];
+
+        // 2. Create Price
+        final priceResp = await http.post(
+          Uri.parse('https://api.stripe.com/v1/prices'),
+          headers: {
+            'Authorization': 'Bearer ${Config.stripeSecretKey}',
+            'Content-Type': 'application/x-www-form-urlencoded',
+          },
+          body: {
+            'unit_amount': (price * 100).toInt().toString(), // Stripe uses cents
+            'currency': 'usd',
+            'recurring[interval]': 'month',
+            'product': productId,
+          },
+        );
+
+        if (priceResp.statusCode != 200) {
+          print('Failed to create Stripe price for $name: ${priceResp.body}');
+          continue;
+        }
+        final stripePriceId = json.decode(priceResp.body)['id'];
+
+        // 3. Update DB
+        await _db.query('UPDATE subscription_plans SET stripe_price_id = @sid WHERE id = @id::uuid', 
+          substitutionValues: {'sid': stripePriceId, 'id': planId});
+        
+        print('Successfully synced $name with Stripe. Price ID: $stripePriceId');
+      }
+    }
+  } catch (e) {
+    print('Error during Stripe plan sync: $e');
+  }
+}
+
+// Returns list of available subscription plans.
+Future<Response> _getPlansHandler(Request request) async {
+  try {
+    final rows = await _db.query('SELECT id, name, member_limit, price FROM subscription_plans ORDER BY price ASC');
+    final plans = rows.map((r) => r.toColumnMap()).toList();
+    return Response.ok(json.encode(plans), headers: {'Content-Type': 'application/json'});
+  } catch (e, st) {
+    print('Error in _getPlansHandler: $e');
+    print(st);
+    return Response.internalServerError(body: json.encode({'message': 'Server error.'}));
+  }
+}
+
+// Returns the current user's subscription details.
+Future<Response> _getCurrentSubscriptionHandler(Request request) async {
+  try {
+    final userId = request.context['userId'] as String?;
+    if (userId == null) return Response.forbidden('Not authorized.');
+
+    final rows = await _db.query(r"""
+      SELECT us.id, us.status, us.card_last_four, us.card_brand, us.created_at, sp.name as plan_name, sp.member_limit, sp.price
+      FROM user_subscriptions us
+      JOIN subscription_plans sp ON us.plan_id = sp.id
+      WHERE us.user_id = @userId::uuid
+    """, substitutionValues: {'userId': userId});
+
+    if (rows.isEmpty) {
+      return Response.ok(json.encode(null), headers: {'Content-Type': 'application/json'});
+    }
+
+    final sub = rows.first.toColumnMap();
+    if (sub['created_at'] is DateTime) sub['created_at'] = (sub['created_at'] as DateTime).toIso8601String();
+    
+    return Response.ok(json.encode(sub), headers: {'Content-Type': 'application/json'});
+  } catch (e, st) {
+    print('Error in _getCurrentSubscriptionHandler: $e');
+    print(st);
+    return Response.internalServerError(body: json.encode({'message': 'Server error.'}));
+  }
+}
+
+// Subscribes a user to a plan using Stripe.
+Future<Response> _subscribeHandler(Request request) async {
+  try {
+    final userId = request.context['userId'] as String?;
+    if (userId == null) return Response.forbidden('Not authorized.');
+
+    final body = json.decode(await request.readAsString()) as Map<String, dynamic>;
+    final planId = body['plan_id'] as String?;
+    final paymentMethodId = body['payment_method_id'] as String?; // Stripe PaymentMethod ID from frontend
+    final isTrial = body['is_trial'] == true;
+
+    if (planId == null || paymentMethodId == null) {
+      return Response(400, body: json.encode({'message': 'Plan ID and Payment Method ID are required.'}));
+    }
+
+    // 1. Get Plan Details (Stripe Price ID)
+    final planRows = await _db.query('SELECT stripe_price_id, name, member_limit FROM subscription_plans WHERE id = @id::uuid', substitutionValues: {'id': planId});
+    if (planRows.isEmpty) return Response(404, body: json.encode({'message': 'Plan not found.'}));
+    final planData = planRows.first.toColumnMap();
+    final stripePriceId = planData['stripe_price_id'] as String?;
+    if (stripePriceId == null || stripePriceId.startsWith('price_placeholder') || stripePriceId.contains('placeholder')) {
+       return Response(500, body: json.encode({'message': 'Server is not configured with a valid Stripe Price ID for this plan.'}));
+    }
+
+    // 2. Get User Email
+    final userRows = await _db.query('SELECT email FROM users WHERE id = @id::uuid', substitutionValues: {'id': userId});
+    final userEmail = userRows.first[0] as String;
+
+    // --- Trail Abuse Prevention ---
+    if (isTrial) {
+      final trialUsed = await _db.query(
+        'SELECT 1 FROM trial_usage WHERE LOWER(email) = LOWER(@email)',
+        substitutionValues: {'email': userEmail},
+      );
+      if (trialUsed.isNotEmpty) {
+        return Response(403, body: json.encode({
+          'message': 'You have already used a trial period on this account or another account with this email.'
+        }), headers: {'Content-Type': 'application/json'});
+      }
+    }
+    // --- End Trail Abuse Prevention ---
+
+    // 3. Create or Get Stripe Customer
+    String? stripeCustomerId;
+    final existingSub = await _db.query('SELECT stripe_customer_id FROM user_subscriptions WHERE user_id = @id::uuid', substitutionValues: {'id': userId});
+    if (existingSub.isNotEmpty) {
+      stripeCustomerId = existingSub.first[0] as String?;
+    }
+
+    if (stripeCustomerId == null) {
+      // Create Customer in Stripe
+      final custResp = await http.post(
+        Uri.parse('https://api.stripe.com/v1/customers'),
+        headers: {
+          'Authorization': 'Bearer ${Config.stripeSecretKey}',
+          'Content-Type': 'application/x-www-form-urlencoded',
+        },
+        body: {
+          'email': userEmail,
+          'metadata[user_id]': userId,
+        },
+      );
+      if (custResp.statusCode != 200) {
+        print('Stripe Customer Error: ${custResp.body}');
+        return Response.internalServerError(body: json.encode({'message': 'Failed to create Stripe customer.'}));
+      }
+      stripeCustomerId = json.decode(custResp.body)['id'];
+    }
+
+    // 4. Attach Payment Method to Customer
+    final attachResp = await http.post(
+      Uri.parse('https://api.stripe.com/v1/payment_methods/$paymentMethodId/attach'),
+      headers: {
+        'Authorization': 'Bearer ${Config.stripeSecretKey}',
+        'Content-Type': 'application/x-www-form-urlencoded',
+      },
+      body: {'customer': stripeCustomerId!},
+    );
+    if (attachResp.statusCode != 200) {
+       print('Stripe Attach PM Error: ${attachResp.body}');
+       // Payment Method might already be attached or invalid
+       // return Response.internalServerError(body: json.encode({'message': 'Failed to attach payment method.'}));
+    }
+
+    // 5. Update Customer Default Payment Method
+    await http.post(
+      Uri.parse('https://api.stripe.com/v1/customers/$stripeCustomerId'),
+      headers: {
+        'Authorization': 'Bearer ${Config.stripeSecretKey}',
+        'Content-Type': 'application/x-www-form-urlencoded',
+      },
+      body: {
+        'invoice_settings[default_payment_method]': paymentMethodId,
+      },
+    );
+
+    // 6. Create Stripe Subscription
+    final Map<String, String> subBody = {
+      'customer': stripeCustomerId!,
+      'items[0][price]': stripePriceId,
+      'expand[]': 'latest_invoice.payment_intent',
+    };
+
+    if (isTrial) {
+      subBody['trial_period_days'] = '7'; // 7-day trial as requested
+    }
+
+    final subResp = await http.post(
+      Uri.parse('https://api.stripe.com/v1/subscriptions'),
+      headers: {
+        'Authorization': 'Bearer ${Config.stripeSecretKey}',
+        'Content-Type': 'application/x-www-form-urlencoded',
+      },
+      body: subBody,
+    );
+
+    if (subResp.statusCode != 200) {
+      print('Stripe Subscription Error: ${subResp.body}');
+      return Response.internalServerError(body: json.encode({'message': 'Failed to create Stripe subscription.'}));
+    }
+
+    final subData = json.decode(subResp.body);
+    final stripeSubscriptionId = subData['id'];
+
+    // 7. Record trial usage if applicable
+    if (isTrial) {
+      await _db.query(
+        'INSERT INTO trial_usage (email) VALUES (LOWER(@email)) ON CONFLICT (email) DO NOTHING',
+        substitutionValues: {'email': userEmail},
+      );
+    }
+
+    // 8. Get Card Info for Display
+    final pmResp = await http.get(
+      Uri.parse('https://api.stripe.com/v1/payment_methods/$paymentMethodId'),
+      headers: {'Authorization': 'Bearer ${Config.stripeSecretKey}'},
+    );
+    String lastFour = '****';
+    String brand = 'Card';
+    if (pmResp.statusCode == 200) {
+      final pmData = json.decode(pmResp.body);
+      lastFour = pmData['card']['last4']?.toString() ?? '****';
+      brand = pmData['card']['brand']?.toString() ?? 'Card';
+    }
+
+    // 8. Update DB
+    await _db.query(r"""
+      INSERT INTO user_subscriptions (user_id, plan_id, stripe_customer_id, stripe_subscription_id, card_last_four, card_brand, status)
+      VALUES (@userId::uuid, @planId::uuid, @custId, @subId, @lastFour, @brand, 'active')
+      ON CONFLICT (user_id) DO UPDATE SET
+        plan_id = EXCLUDED.plan_id,
+        stripe_customer_id = EXCLUDED.stripe_customer_id,
+        stripe_subscription_id = EXCLUDED.stripe_subscription_id,
+        card_last_four = EXCLUDED.card_last_four,
+        card_brand = EXCLUDED.card_brand,
+        status = 'active',
+        created_at = now()
+    """, substitutionValues: {
+      'userId': userId,
+      'planId': planId,
+      'custId': stripeCustomerId,
+      'subId': stripeSubscriptionId,
+      'lastFour': lastFour,
+      'brand': brand,
+    });
+
+    return Response.ok(json.encode({'success': true, 'message': 'Subscribed successfully.'}));
+  } catch (e, st) {
+    print('Error in _subscribeHandler: $e');
+    print(st);
+    return Response.internalServerError(body: json.encode({'message': 'Server error: $e'}));
   }
 }

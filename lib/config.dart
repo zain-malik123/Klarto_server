@@ -28,6 +28,8 @@ class Config {
 
   static String get clientBaseUrl => _env['CLIENT_BASE_URL']!;
 
+  static String get stripeSecretKey => _env['STRIPE_SECRET_KEY'] ?? '';
+
   static String get serverBaseUrl {
     // This is useful for constructing URLs within the server if needed.
     // The client-side base URL will be configured separately in the Flutter app.
